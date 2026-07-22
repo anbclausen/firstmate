@@ -15,8 +15,10 @@
 #                 "SECONDMATE_SYNC: secondmate <id>: skipped: <reason>",
 #                 "NUDGE_SECONDMATES: secondmate <id>: send failed: <reason>",
 #                 "BOOTSTRAP_INFO: nudged fm-<id> with '<message>'",
+#                 "BOOTSTRAP_INFO: no private context repo configured ...",
 #                 "SECONDMATE_LIVENESS: secondmate <id>: skipped: <reason>|respawn failed: <reason>",
-#                 "FMX: X mode on ..." or "FMX: X mode off ...".
+#                 "FMX: X mode on ..." or "FMX: X mode off ...",
+#                 "PODMAN_GC: removed <n> orphaned container(s) and <n> dangling image(s) (label=firstmate.managed=true)".
 #          When a RUNNING secondmate worktree is fast-forwarded to firstmate's
 #          own current default-branch commit (a purely LOCAL fast-forward, never
 #          an origin fetch) AND its loaded instruction surface (AGENTS.md, bin/,
@@ -66,9 +68,21 @@
 #          refresh relays any completed fm-fleet-sync.sh output before the
 #          aggregate timeout skip line with timeout and elapsed seconds.
 #          Set FM_FLEET_PRUNE=0 to skip branch pruning during that refresh.
-#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the five MUTATING sweeps
+#          The private-context-repo advisory fires once per home: it prints
+#          while config/private-context-repo is absent, then writes
+#          state/.private-context-nudged (skipped in detect-only mode) so it
+#          never repeats. Configuring config/private-context-repo, or
+#          removing the marker, are the only ways to see it again.
+#          podman_gc runs at most once per FM_PODMAN_GC_INTERVAL_SECS (default
+#          86400s/24h, tracked in state/.podman-gc-last) and only when `podman`
+#          is installed; it removes only firstmate-labeled
+#          (label=firstmate.managed=true) stopped orphan containers and
+#          dangling rebuilt image layers, never a captain's own unrelated
+#          podman resources - see bin/backends/podman.sh's
+#          fm_backend_podman_gc and docs/podman-backend.md "Garbage collection".
+#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the six MUTATING sweeps
 #          (PR-check migration, secondmate_sync, secondmate_liveness_sweep,
-#          x_mode_setup, fleet_sync) while still printing every read-only detect line
+#          x_mode_setup, fleet_sync, podman_gc) while still printing every read-only detect line
 #          above; the TANGLE line switches to advisory-only wording with no
 #          checkout command. Used by
 #          fm-session-start.sh's read-only path when another live session holds
@@ -100,6 +114,48 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 . "$SCRIPT_DIR/fm-x-lib.sh"
 # shellcheck source=bin/fm-backend.sh disable=SC1091
 . "$SCRIPT_DIR/fm-backend.sh"
+
+# podman_gc: label-scoped garbage collection for firstmate-owned podman
+# resources (bin/backends/podman.sh's fm_backend_podman_gc), so long-running
+# use of backend=podman does not silently fill the machine's disk with
+# orphaned task containers and stale rebuilt image layers. Runs at most once
+# per FM_PODMAN_GC_INTERVAL_SECS (default 24h) via a durable
+# state/.podman-gc-last timestamp marker, mirroring the cadence-marker
+# pattern the rest of bootstrap's periodic maintenance already uses. Skipped
+# entirely when `podman` is not installed - podman may never have been used
+# on this machine, and probing for orphans would just be a slow no-op.
+# Filtering is entirely the adapter's job (every podman call it makes reads
+# `label=firstmate.managed=true` first); this function only owns cadence and
+# the silent-vs-actionable reporting split: nothing removed stays a quiet
+# BOOTSTRAP_INFO fact (only with FM_BOOTSTRAP_VERBOSE_FACTS=1, matching the
+# rest of bootstrap's verbose-only "nothing to do" facts), while removing
+# ANYTHING is reported as an actionable PODMAN_GC line so the captain can see
+# real reclaimed disk over time without needing to check silently.
+FM_PODMAN_GC_INTERVAL_SECS=${FM_PODMAN_GC_INTERVAL_SECS:-86400}
+podman_gc() {
+  command -v podman >/dev/null 2>&1 || return 0
+  local marker="$STATE/.podman-gc-last" now last age result containers images
+  now=$(date +%s)
+  if [ -f "$marker" ]; then
+    last=$(tr -d '[:space:]' < "$marker" 2>/dev/null)
+    case "$last" in *[!0-9]*|'') last=0 ;; esac
+    age=$((now - last))
+    [ "$age" -ge "$FM_PODMAN_GC_INTERVAL_SECS" ] || return 0
+  fi
+  fm_backend_source podman || return 0
+  result=$(fm_backend_podman_gc 2>/dev/null) || result="0 0"
+  containers=${result%% *}
+  images=${result##* }
+  case "$containers" in *[!0-9]*|'') containers=0 ;; esac
+  case "$images" in *[!0-9]*|'') images=0 ;; esac
+  mkdir -p "$STATE" 2>/dev/null || true
+  printf '%s' "$now" > "$marker" 2>/dev/null || true
+  if [ "$containers" -gt 0 ] || [ "$images" -gt 0 ]; then
+    echo "PODMAN_GC: removed $containers orphaned container(s) and $images dangling image(s) (label=firstmate.managed=true)"
+  elif [ "${FM_BOOTSTRAP_VERBOSE_FACTS:-0}" = 1 ]; then
+    echo "BOOTSTRAP_INFO: podman garbage collection ran, nothing to reclaim"
+  fi
+}
 
 fleet_sync_origin_backed_project_count() {
   local count proj
@@ -480,7 +536,7 @@ secondmate_liveness_sweep() {
 
 install_cmd() {
   case "$1" in
-    tmux|node|git|gh|curl|jq|orca|zellij) echo "brew install $1  # or the platform's package manager" ;;
+    tmux|node|git|gh|curl|jq|orca|zellij|podman) echo "brew install $1  # or the platform's package manager" ;;
     cmux) echo "brew install --cask cmux  # or see https://cmux.com" ;;
     treehouse) echo "curl -fsSL https://kunchenguid.github.io/treehouse/install.sh | sh" ;;
     no-mistakes) echo "curl -fsSL https://raw.githubusercontent.com/kunchenguid/no-mistakes/main/docs/install.sh | sh" ;;
@@ -851,6 +907,12 @@ if [ "${FM_BOOTSTRAP_VERBOSE_FACTS:-0}" = 1 ] && [ -n "$crew" ] && [ "$crew" != 
   echo "BOOTSTRAP_INFO: crew harness override active: $crew"
 fi
 crew_dispatch_validate
+if [ ! -f "$CONFIG/private-context-repo" ] && [ ! -f "$STATE/.private-context-nudged" ]; then
+  echo "BOOTSTRAP_INFO: no private context repo configured - a private GitHub repo lets firstmate reference durable private context at session start; see docs/configuration.md 'Private context repo' and set config/private-context-repo (one-time advisory, will not repeat)"
+  if [ "${FM_BOOTSTRAP_DETECT_ONLY:-0}" != 1 ]; then
+    mkdir -p "$STATE" 2>/dev/null && : > "$STATE/.private-context-nudged"
+  fi
+fi
 if [ "${FM_BOOTSTRAP_VERBOSE_FACTS:-0}" = 1 ] \
   && ! fm_backlog_backend_manual "$CONFIG" && fm_tasks_axi_compatible; then
   echo "BOOTSTRAP_INFO: tasks-axi available"
@@ -860,5 +922,6 @@ if [ "${FM_BOOTSTRAP_DETECT_ONLY:-0}" != 1 ]; then
   secondmate_sync
   x_mode_setup
   fleet_sync
+  podman_gc
 fi
 exit 0

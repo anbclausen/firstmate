@@ -3,7 +3,7 @@ name: bootstrap-diagnostics
 description: >-
   Agent-only handling playbook for session-start bootstrap diagnostics.
   Use whenever the session-start digest's bootstrap section prints an actionable diagnostic line - MISSING, MISSING_MANUAL, BACKEND_INVALID, NEEDS_GH_AUTH, TANGLE, CREW_DISPATCH invalid, FLEET_SYNC, PR_CHECK_MIGRATION, SECONDMATE_SYNC, SECONDMATE_LIVENESS, NUDGE_SECONDMATES, or FMX - or when a standalone bin/fm-bootstrap.sh run prints one of those lines.
-  A silent bootstrap section, or a BOOTSTRAP_INFO fact, means no skill load.
+  A silent bootstrap section, a BOOTSTRAP_INFO fact, or a PODMAN_GC line means no skill load - PODMAN_GC is a routine cleanup report, never a problem to fix.
 user-invocable: false
 metadata:
   internal: true
@@ -50,3 +50,4 @@ When any diagnostic needs captain attention, report the plain consequence and re
   Inspect the reason, keep the pending marker under `state/.secondmate-nudge-pending/` intact, and rerun session start after the endpoint or metadata issue is fixed so bootstrap can retry the exact same marked send.
 - `FMX: X mode on ...` / `FMX: X mode off ...` - bootstrap confirmed or removed the local X-mode poll artifacts (`docs/configuration.md` "X mode (.env)").
   Only when a running watcher needs the cadence transition applied immediately, restart the home-scoped watcher through the emitted harness supervision protocol; bootstrap deliberately never restarts the watcher itself.
+- `PODMAN_GC: removed <n> orphaned container(s) and <n> dangling image(s) (label=firstmate.managed=true)` - informational only, not actionable; the label-scoped sweep (`docs/podman-backend.md` "Garbage collection") reclaimed disk from crashed or skipped-teardown podman tasks and stale rebuilt image layers. Batch it into the next natural update if the captain would find it interesting; never treat it as a problem needing a response.

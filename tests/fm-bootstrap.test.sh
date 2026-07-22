@@ -37,6 +37,11 @@ unset TMUX TMUX_PANE HERDR_ENV HERDR_PANE_ID HERDR_SESSION HERDR_SOCKET_PATH \
 # treehouse's `get --help` advertises --lease only when FM_FAKE_TREEHOUSE_LEASE_HELP=1.
 make_fake_toolchain() {
   local dir=$1 fakebin
+  # Pre-mark the one-time private-context-repo advisory as already seen so
+  # this suite's unrelated toolchain/dispatch/liveness cases stay silent by
+  # default; test_private_context_repo_advisory below covers the advisory
+  # itself against a fresh home.
+  mkdir -p "$dir/home/state" && : > "$dir/home/state/.private-context-nudged"
   fakebin=$(fm_fakebin "$dir")
   fm_fake_exit0 "$fakebin" tmux node gh-axi chrome-devtools-axi lavish-axi
   cat > "$fakebin/gh" <<'SH'
@@ -475,7 +480,7 @@ test_unknown_backend_reports_invalid_configuration() {
   fakebin=$(make_fake_toolchain "$case_dir")
   out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
     FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
-  assert_contains "$out" "BACKEND_INVALID: bogus (known: tmux herdr zellij orca cmux)" \
+  assert_contains "$out" "BACKEND_INVALID: bogus (known: tmux herdr zellij orca cmux podman)" \
     "bootstrap should report an unknown resolved backend"
   assert_not_contains "$out" "MISSING: tmux" "an unknown backend should not silently fall back to tmux dependencies"
   pass "bootstrap: unknown resolved backends fail closed with an actionable diagnostic"
@@ -786,8 +791,51 @@ ROWS
   pass "bootstrap validates crew-dispatch.json and reports malformed or unverified configs"
 }
 
+test_private_context_repo_advisory() {
+  local case_dir fakebin out marker
+  case_dir="$TMP_ROOT/private-context-fresh"
+  mkdir -p "$case_dir/home"
+  fakebin=$(fm_fakebin "$case_dir")
+  fm_fake_exit0 "$fakebin" tmux node gh-axi chrome-devtools-axi lavish-axi gh treehouse no-mistakes tasks-axi quota-axi jq
+  marker="$case_dir/home/state/.private-context-nudged"
+
+  [ ! -e "$marker" ] || fail "marker should not pre-exist for a fresh home"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" "BOOTSTRAP_INFO: no private context repo configured" \
+    "fresh home without config/private-context-repo should print the one-time advisory"
+  [ -f "$marker" ] || fail "advisory should write state/.private-context-nudged after printing"
+
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" "$ROOT/bin/fm-bootstrap.sh")
+  assert_not_contains "$out" "no private context repo configured" \
+    "advisory must not repeat once the marker exists"
+
+  case_dir="$TMP_ROOT/private-context-configured"
+  mkdir -p "$case_dir/home/config"
+  printf '%s\n' 'git@github.com:example/private-context.git' > "$case_dir/home/config/private-context-repo"
+  fakebin=$(fm_fakebin "$case_dir")
+  fm_fake_exit0 "$fakebin" tmux node gh-axi chrome-devtools-axi lavish-axi gh treehouse no-mistakes tasks-axi quota-axi jq
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" "$ROOT/bin/fm-bootstrap.sh")
+  assert_not_contains "$out" "no private context repo configured" \
+    "configured config/private-context-repo should suppress the advisory"
+  [ ! -e "$case_dir/home/state/.private-context-nudged" ] || fail "marker should not be needed once configured"
+
+  case_dir="$TMP_ROOT/private-context-detect-only"
+  mkdir -p "$case_dir/home"
+  fakebin=$(fm_fakebin "$case_dir")
+  fm_fake_exit0 "$fakebin" tmux node gh-axi chrome-devtools-axi lavish-axi gh treehouse no-mistakes tasks-axi quota-axi jq
+  marker="$case_dir/home/state/.private-context-nudged"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_BOOTSTRAP_DETECT_ONLY=1 "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" "BOOTSTRAP_INFO: no private context repo configured" \
+    "detect-only mode should still print the advisory"
+  [ ! -e "$marker" ] || fail "detect-only mode must not write the suppression marker"
+
+  pass "bootstrap prints the private-context-repo advisory once and honors config/marker suppression"
+}
+
 test_bootstrap_reporting
 test_no_mistakes_min_version
+test_private_context_repo_advisory
 test_git_is_required_with_supported_install_instruction
 test_orca_backend_gates_orca_tool_only_when_selected
 test_session_provider_backends_do_not_require_tmux

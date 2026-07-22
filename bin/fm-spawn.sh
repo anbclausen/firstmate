@@ -1081,7 +1081,44 @@ spawn_send_key() {  # <target> <key>
     podman) fm_backend_podman_send_key "$1" "$2" "$W" ;;
   esac
 }
-if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
+if [ "$KIND" = secondmate ] || [ "$BACKEND" = orca ]; then
+  :
+elif [ "$BACKEND" = podman ]; then
+  # Interactive `treehouse get` (typed into the pane, subshell-tracked) relies
+  # on treehouse seeing a LIVE PROCESS holding a pool slot to know it's taken -
+  # true when every crewmate shares the primary's one filesystem/PID namespace
+  # (tmux/herdr/zellij/cmux), false for podman, where each crewmate is its own
+  # container with its own PID namespace. Tried once (2026-07-22): a shared
+  # ~/.treehouse volume across a project's crewmate containers plus ordinary
+  # interactive `treehouse get` let two concurrent crewmates silently land in
+  # and share the SAME worktree (verified with a cross-container marker file)
+  # instead of erroring, because neither container could see the other's
+  # process holding that slot. `--lease` instead marks a worktree taken in
+  # treehouse's own PERSISTENT STATE (docs: "reserves the worktree and marks
+  # it leased... never handed out by a later get... until you release it"),
+  # which a shared volume DOES make visible cross-container without needing
+  # process visibility. Called directly via podman exec (not typed into the
+  # pane) since --lease is synchronous and prints just the path to stdout -
+  # no polling for a cwd change needed, unlike the interactive form below.
+  WT=$(podman exec "$PODMAN_CONTAINER" treehouse get --lease --lease-holder "$ID")
+  wt_rc=$?
+  if [ $wt_rc -ne 0 ] || [ -z "$WT" ]; then
+    echo "error: 'treehouse get --lease' failed for podman container '$PODMAN_CONTAINER' (exit $wt_rc)" >&2
+    exit 1
+  fi
+  spawn_send_text_line "$WT_TARGET" "cd $(shell_quote "$WT")"
+  landed=0
+  for _ in $(seq 1 15); do
+    p=$(spawn_current_path "$WT_TARGET" || true)
+    [ "$p" = "$WT" ] && { landed=1; break; }
+    sleep 1
+  done
+  if [ "$landed" -ne 1 ]; then
+    echo "error: pane did not cd into the leased worktree '$WT' within 15s; inspect window $T" >&2
+    exit 1
+  fi
+  validate_spawn_worktree "treehouse get --lease" "$T"
+else
   spawn_send_text_line "$WT_TARGET" 'treehouse get'
 
   # Wait for the treehouse subshell: the pane's cwd moves from the project to the worktree.

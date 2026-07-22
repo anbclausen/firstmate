@@ -190,6 +190,24 @@ FM_BACKEND_PODMAN_RUN_FLAGS=(
   '--pids-limit=512'
 )
 
+# fm_backend_podman_treehouse_volume: the shared, persistent named volume
+# every podman crewmate container for <proj_abs> mounts at ~/.treehouse, so
+# treehouse's own worktree pool state is genuinely visible across separate
+# crewmate containers for the same project - required for `treehouse get
+# --lease` (bin/fm-spawn.sh) to correctly see a sibling container's lease
+# instead of handing out the same slot twice. A first attempt (2026-07-22)
+# paired this same shared volume with plain interactive `treehouse get` and
+# made things WORSE (two containers silently shared one worktree - treehouse's
+# interactive-mode collision detection depends on OS process visibility,
+# which a shared volume alone does not provide across separate podman PID
+# namespaces). `--lease` instead tracks acquisition in treehouse's own
+# persistent state, which sharing this volume actually does make visible
+# cross-container - see bin/fm-spawn.sh's podman branch for the acquisition
+# side of this pairing.
+fm_backend_podman_treehouse_volume() {  # <proj_abs>
+  printf 'fm-treehouse-%s-%s' "$(fm_backend_podman_home_label)" "$(fm_backend_podman_path_hash "$1")"
+}
+
 # fm_backend_podman_create_task: start the task's container from the
 # resolved image, mounting the project clone read-write at
 # FM_BACKEND_PODMAN_MOUNT (see the file header's "OPEN ASSUMPTION" - treehouse
@@ -199,7 +217,7 @@ FM_BACKEND_PODMAN_RUN_FLAGS=(
 # name on success; the caller composes the full "<name>@@<tmux_target>"
 # target string once the tmux session is confirmed up.
 fm_backend_podman_create_task() {  # <label> <proj_abs> <kind>
-  local label=$1 proj_abs=$2 kind=$3 name image profile net_flag
+  local label=$1 proj_abs=$2 kind=$3 name image profile net_flag treehouse_vol
   name=$(fm_backend_podman_container_name "$label")
   if podman container exists "$name" 2>/dev/null; then
     echo "error: podman container '$name' already exists" >&2
@@ -209,6 +227,7 @@ fm_backend_podman_create_task() {  # <label> <proj_abs> <kind>
   profile=$(fm_backend_podman_profile_for "$kind")
   fm_backend_podman_label_args
   FM_BACKEND_PODMAN_LABEL_ARGS+=(--label "firstmate.task=$label")
+  treehouse_vol=$(fm_backend_podman_treehouse_volume "$proj_abs")
   if [ "$profile" = "$FM_BACKEND_PODMAN_SCOUT_PROFILE" ]; then
     # Investigation profile: read-only project mount plus a small rw scratch
     # dir, and no network by default - least privilege for read-mostly work.
@@ -217,6 +236,7 @@ fm_backend_podman_create_task() {  # <label> <proj_abs> <kind>
       --read-only \
       "$net_flag" \
       -v "$proj_abs:$FM_BACKEND_PODMAN_MOUNT:ro" \
+      -v "$treehouse_vol:/home/agent/.treehouse" \
       --tmpfs "$FM_BACKEND_PODMAN_MOUNT/.fm-scratch:rw,size=512m" \
       --tmpfs /home/agent/.claude:rw,size=64m \
       --tmpfs /tmp \
@@ -230,6 +250,7 @@ fm_backend_podman_create_task() {  # <label> <proj_abs> <kind>
     # mounted. Network stays on (bridge) - a coding task needs registries/gh.
     if ! podman run -d --name "$name" "${FM_BACKEND_PODMAN_RUN_FLAGS[@]}" "${FM_BACKEND_PODMAN_LABEL_ARGS[@]}" \
       -v "$proj_abs:$FM_BACKEND_PODMAN_MOUNT:rw" \
+      -v "$treehouse_vol:/home/agent/.treehouse" \
       --tmpfs /tmp \
       "$image" sleep infinity >/dev/null 2>&1; then
       echo "error: podman run failed to start dev container '$name'" >&2

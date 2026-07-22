@@ -71,6 +71,7 @@ config/backend  runtime session-provider backend override for new tasks; LOCAL, 
 config/herdr-presentation-spaces  optional presence flag for Herdr's default-off disposable single-task visual projection; LOCAL, gitignored; inherited by secondmate homes; see docs/herdr-backend.md "Optional disposable single-task presentation spaces"
 config/cmux-socket-password  optional cmux control-socket password; LOCAL, gitignored; read fresh on every cmux CLI call and passed through without ever overriding an operator's own ambient CMUX_SOCKET_PASSWORD when absent (docs/cmux-backend.md "Setup")
 config/wedge-alarm  optional away-mode wedge-alarm active-alert directives; LOCAL, gitignored; absent means auto (macOS Notification Center when available); see docs/wedge-alarm.md
+config/private-context-repo  optional private GitHub repo URL for durable private context; LOCAL, gitignored, one line; absent = bootstrap prints a one-time advisory to set it up (docs/configuration.md "Private context repo"); when cloned, holds captain-owned captains-notes.md (read-only for firstmate absent explicit consent) and firstmate-owned notes-on-captain.md
 config/x-mode.env    generated X-mode watcher cadence; LOCAL, gitignored; source before arming watcher when present
 data/                personal fleet records; LOCAL, gitignored as a whole
   backlog.md         task queue, dependencies, history
@@ -108,6 +109,7 @@ state/               volatile runtime signals; gitignored
   .watch-triage.log  watcher's absorbed-wake debug log (size-capped); never relied on, safe to delete
   .last-watcher-beat watcher liveness beacon, touched every poll (including while absorbing benign wakes); guard scripts read it
   .subsuper-* .supervise-daemon.*   sub-supervisor internals; never touch
+  .private-context-nudged  marker suppressing the repeat of the one-time private-context-repo bootstrap advisory once printed; delete to see the advisory again
 .no-mistakes/        local validation state and evidence; gitignored
 ```
 
@@ -154,6 +156,7 @@ A silent bootstrap section needs no action; for any printed actionable diagnosti
 ## 4. Harness and runtime dispatch
 
 Load `harness-adapters` before every spawn or recovery and before trust handling, skill invocation, interrupt, exit, resume, or adapter verification.
+Additionally load `podman-containerization` before spawning a task on the experimental `podman` runtime backend; it owns the container-selection decision that backend adds on top of the ordinary harness choice.
 The verified harnesses are `claude`, `codex`, `opencode`, `pi`, and `grok`; never dispatch on an unverified adapter.
 If configured harness data names an unverified adapter, report it and fall back only to a verified adapter rather than launching it.
 
@@ -457,6 +460,7 @@ These skills are not captain-invocable; load them only at their precise triggers
 - `diagnostic-reasoning` - load before scoping a reported bug and before acting on a diagnostic report.
 - `harness-adapters` - load before spawning or recovering a crewmate or secondmate, handling a trust dialog, sending a harness-specific skill invocation, interrupting or exiting an agent, resuming an exited agent, or verifying a new harness adapter.
 - `firstmate-orca` - load before switching to Orca, spawning or supervising Orca-backed work, smoke-testing Orca backend behavior, debugging Orca task state, or reconciling Orca-backed task metadata.
+- `podman-containerization` - load before spawning a crewmate on the experimental podman runtime backend; owns container-image selection (project `Containerfile` override vs. the standard `dev`/`scout` profiles) and the least-privilege rationale.
 - `project-management` - load before adding, creating, removing, or initializing a project.
 - `stuck-crewmate-recovery` - load when the session-start digest reports an ordinary direct report's endpoint dead or its metadata has no window, or after a stale wake, looping pane, repeated confusion, an answered-by-brief question, an unresponsive crewmate, or a failed steer.
 - `secondmate-provisioning` - load before creating, seeding, validating, launching, handing backlog to, recovering, pushing inherited local material into, or retiring a secondmate home, and before editing `data/secondmates.md`.

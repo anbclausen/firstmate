@@ -16,14 +16,17 @@
 #   fm_backend_detect, with cmux fallback details in docs/cmux-backend.md),
 #   then tmux.
 #   Spawn-capable backends are the reference tmux adapter and experimental
-#   herdr, zellij, orca, and cmux. Orca owns both the task worktree and
-#   terminal, so ship/scout Orca spawns do not run treehouse get; cmux is a
-#   session provider only, exactly like herdr/zellij, so it does. An
-#   auto-detected herdr or cmux spawn prints a loud stderr notice;
-#   auto-detected tmux stays silent; zellij and orca are never auto-detected.
+#   herdr, zellij, orca, cmux, and podman. Orca owns both the task worktree and
+#   terminal, so ship/scout Orca spawns do not run treehouse get; cmux and
+#   podman are session providers only, exactly like herdr/zellij, so they do.
+#   An auto-detected herdr or cmux spawn prints a loud stderr notice;
+#   auto-detected tmux stays silent; zellij, orca, and podman are never
+#   auto-detected - podman owns a differently-isolated (containerized)
+#   execution context that must always be an explicit choice (docs/podman-backend.md).
 #   codex-app is not a known backend yet; docs/codex-app-backend.md owns that
 #   blocked backend contract. Default tmux spawns do not write backend= to meta;
-#   absent backend= means tmux. cmux does not support --secondmate spawns yet.
+#   absent backend= means tmux. cmux and podman do not support --secondmate
+#   spawns yet.
 #   A backend spawn refusal (missing dependency, version gate, unauthenticated
 #   socket, or unsupported secondmate mode) is terminal for that selected backend;
 #   callers must surface it instead of silently retrying another backend.
@@ -210,6 +213,10 @@ if [ "$BACKEND" = orca ] && [ "$KIND" = secondmate ]; then
 fi
 if [ "$BACKEND" = cmux ] && [ "$KIND" = secondmate ]; then
   echo "error: backend=cmux does not support --secondmate spawns yet" >&2
+  exit 1
+fi
+if [ "$BACKEND" = podman ] && [ "$KIND" = secondmate ]; then
+  echo "error: backend=podman does not support --secondmate spawns yet" >&2
   exit 1
 fi
 if [ "$BACKEND" = orca ]; then
@@ -965,6 +972,15 @@ EOF
     fi
     T="$CMUX_WORKSPACE_ID:$CMUX_SURFACE_ID"
     ;;
+  podman)
+    fm_backend_podman_container_ensure || exit 1
+    PODMAN_CONTAINER=$(fm_backend_podman_create_task "$W" "$PROJ_ABS" "$KIND") || exit 1
+    if [ -z "$PODMAN_CONTAINER" ]; then
+      echo "error: podman did not return a container name for $W" >&2
+      exit 1
+    fi
+    T="$PODMAN_CONTAINER@@$FM_BACKEND_PODMAN_TMUX_SESSION"
+    ;;
   orca)
     set +e
     ORCA_WT_RAW=$(fm_backend_orca_worktree_create "$PROJ_ABS" "$W")
@@ -1004,6 +1020,7 @@ spawn_send_text_line() {  # <target> <text>
     zellij) fm_backend_zellij_send_text_line "$1" "$2" "$W" ;;
     orca) fm_backend_orca_send_text_line "$1" "$2" ;;
     cmux) fm_backend_cmux_send_text_line "$1" "$2" "$W" ;;
+    podman) fm_backend_podman_send_text_line "$1" "$2" "$W" ;;
   esac
 }
 spawn_current_path() {  # <target>
@@ -1012,6 +1029,7 @@ spawn_current_path() {  # <target>
     herdr) fm_backend_herdr_current_path "$1" ;;
     zellij) fm_backend_zellij_current_path "$1" "$W" ;;
     cmux) fm_backend_cmux_current_path "$1" "$W" ;;
+    podman) fm_backend_podman_current_path "$1" "$W" ;;
   esac
 }
 spawn_send_literal() {  # <target> <text>
@@ -1021,6 +1039,7 @@ spawn_send_literal() {  # <target> <text>
     zellij) fm_backend_zellij_send_literal "$1" "$2" "$W" ;;
     orca) fm_backend_orca_send_literal "$1" "$2" ;;
     cmux) fm_backend_cmux_send_literal "$1" "$2" "$W" ;;
+    podman) fm_backend_podman_send_literal "$1" "$2" "$W" ;;
   esac
 }
 spawn_send_key() {  # <target> <key>
@@ -1030,6 +1049,7 @@ spawn_send_key() {  # <target> <key>
     zellij) fm_backend_zellij_send_key "$1" "$2" "$W" ;;
     orca) fm_backend_orca_send_key "$1" "$2" ;;
     cmux) fm_backend_cmux_send_key "$1" "$2" "$W" ;;
+    podman) fm_backend_podman_send_key "$1" "$2" "$W" ;;
   esac
 }
 if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
@@ -1244,6 +1264,9 @@ META_WINDOW=$T
   if [ "$BACKEND" = cmux ]; then
     echo "cmux_workspace_id=$CMUX_WORKSPACE_ID"
     echo "cmux_surface_id=$CMUX_SURFACE_ID"
+  fi
+  if [ "$BACKEND" = podman ]; then
+    echo "podman_container=$PODMAN_CONTAINER"
   fi
   if [ "$KIND" = secondmate ]; then
     echo "home=$PROJ_ABS"

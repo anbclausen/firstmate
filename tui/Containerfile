@@ -1,0 +1,32 @@
+# tui/Containerfile - this crate's own build environment, not the firstmate
+# primary's (see firstmate.Containerfile at the repo root for that one).
+#
+# Least privilege: installs only what building and testing this crate needs
+# (a C toolchain for linking, pkg-config for any native deps a future
+# terminal/pty backend pulls in, and Rust itself), and drops root before
+# any build ever runs. No fleet plumbing (tmux/gh/node/axi tools) belongs
+# here; this image only ever runs `cargo build` / `cargo test` for tui/.
+FROM debian:12-slim
+LABEL firstmate.managed=true
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+     build-essential pkg-config ca-certificates curl \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -s /bin/bash agent
+USER agent
+WORKDIR /home/agent
+
+# Installed as the non-root agent user so the toolchain lives under
+# /home/agent/.cargo and /home/agent/.rustup, not a root-owned system path.
+ENV RUSTUP_HOME=/home/agent/.rustup \
+    CARGO_HOME=/home/agent/.cargo \
+    PATH=/home/agent/.cargo/bin:$PATH
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+     | sh -s -- -y --default-toolchain stable --profile minimal
+
+WORKDIR /work/tui
+
+CMD ["cargo", "test"]

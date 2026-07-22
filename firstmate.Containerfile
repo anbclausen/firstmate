@@ -47,6 +47,14 @@ RUN curl -fsSL https://raw.githubusercontent.com/kunchenguid/no-mistakes/main/do
   && chmod o+x /root \
   && chmod -R o+rX /root/.no-mistakes
 
+# The repo is bind-mounted at its own host path (see run.sh), owned by
+# whatever uid runs podman on the host - almost never root, which is what
+# this primary runs as (--user 0:0, for podman-socket access). Without this,
+# every git operation in the primary's own checkout refuses with "detected
+# dubious ownership". Matches the same fix already in containers/dev.Containerfile
+# and containers/scout.Containerfile for crewmate images.
+RUN git config --system --add safe.directory '*'
+
 RUN useradd -m -s /bin/bash agent
 USER agent
 WORKDIR /work/firstmate

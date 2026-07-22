@@ -218,6 +218,7 @@ fm_backend_podman_create_task() {  # <label> <proj_abs> <kind>
       "$net_flag" \
       -v "$proj_abs:$FM_BACKEND_PODMAN_MOUNT:ro" \
       --tmpfs "$FM_BACKEND_PODMAN_MOUNT/.fm-scratch:rw,size=512m" \
+      --tmpfs /home/agent/.claude:rw,size=64m \
       --tmpfs /tmp \
       "$image" sleep infinity >/dev/null 2>&1; then
       echo "error: podman run failed to start scout container '$name'" >&2
@@ -235,7 +236,25 @@ fm_backend_podman_create_task() {  # <label> <proj_abs> <kind>
       return 1
     fi
   fi
-  if ! podman exec -d "$name" tmux new-session -d -s "$FM_BACKEND_PODMAN_TMUX_SESSION" -c "$FM_BACKEND_PODMAN_MOUNT" 2>/dev/null; then
+  # Seed Claude credentials into the crewmate's OWN writable ~/.claude by
+  # copying (not bind-mounting) from the primary's own already-authenticated
+  # $HOME/.claude - `podman cp` streams from the CALLING process's (the
+  # primary's) filesystem view over the API, unlike `-v`, whose source must
+  # be visible to the podman daemon itself (the podman-machine VM's own
+  # filesystem for a containerized primary, which the primary's internal
+  # /home/agent path is not - see docs/podman-backend.md). A copy, not a
+  # live mount, also means Claude Code's own writes (session-env, transcripts,
+  # trust-map updates) land in each crewmate's own throwaway copy instead of
+  # racing concurrent crewmates against each other or the primary's real
+  # credential file.
+  if [ -d "$HOME/.claude" ]; then
+    podman cp "$HOME/.claude/." "$name:/home/agent/.claude" >/dev/null 2>&1 || true
+  fi
+  if [ -f "$HOME/.claude.json" ]; then
+    podman cp "$HOME/.claude.json" "$name:/home/agent/.claude.json" >/dev/null 2>&1 || true
+  fi
+  podman exec -u root "$name" chown -R agent:agent /home/agent/.claude /home/agent/.claude.json >/dev/null 2>&1 || true
+  if ! podman exec -d "$name" tmux new-session -d -s "$FM_BACKEND_PODMAN_TMUX_SESSION" -c "$FM_BACKEND_PODMAN_MOUNT" >/dev/null 2>&1; then
     echo "error: failed to start the in-container tmux session for '$name' (does the image have tmux installed?)" >&2
     podman rm -f "$name" >/dev/null 2>&1 || true
     return 1
@@ -271,14 +290,15 @@ fm_backend_podman_target_ready() {  # <target> [expected-label]
   fm_backend_podman_exec "$FM_BACKEND_PODMAN_CONTAINER" has-session -t "$FM_BACKEND_PODMAN_TMUX_SESSION" >/dev/null 2>&1
 }
 
-# fm_backend_podman_current_path: always FM_BACKEND_PODMAN_MOUNT - the bind
-# mount point is fixed at container-create time, so (unlike zellij/cmux)
-# this needs no active pwd-marker probe. fm-spawn.sh's worktree-detection
-# poll still calls this each iteration; it settles on the FIRST call because
-# the value never depends on treehouse having finished cd'ing yet.
+# fm_backend_podman_current_path: the pane's actual live cwd inside the
+# container, via tmux's own pane_current_path - fm-spawn.sh's worktree-
+# detection poll needs this to change once `treehouse get` cd's the pane
+# into its new worktree; it cannot be assumed to stay at
+# FM_BACKEND_PODMAN_MOUNT forever the way an earlier version of this
+# function did (that made the poll unable to ever detect the move at all).
 fm_backend_podman_current_path() {  # <target> [expected-label]
   fm_backend_podman_target_ready "$1" "${2:-}" || return 0
-  printf '%s' "$FM_BACKEND_PODMAN_MOUNT"
+  fm_backend_podman_exec "$FM_BACKEND_PODMAN_CONTAINER" display-message -p -t "$FM_BACKEND_PODMAN_TMUX_TARGET" '#{pane_current_path}' 2>/dev/null
 }
 
 fm_backend_podman_capture() {  # <target> <lines> [expected-label]

@@ -779,6 +779,38 @@ real_path_or_raw() {  # <path>
   fi
 }
 
+# A podman crewmate runs in its own separate container/filesystem, unlike
+# every other backend's pane, which shares the primary's own filesystem. So
+# a path reported from inside a podman crewmate's pane (its project mount,
+# or the worktree treehouse moves it into) is never actually reachable via
+# a local `cd`/`git -C` from the primary's own process - it has to be
+# resolved and checked from INSIDE that same container instead. These two
+# helpers give the polling loop and validate_spawn_worktree below a single
+# backend-aware seam instead of assuming shared-filesystem access.
+spawn_baseline_real() {  # -> the pane's starting path, before treehouse get
+  if [ "$BACKEND" = podman ]; then
+    printf '%s\n' "$FM_BACKEND_PODMAN_MOUNT"
+  else
+    printf '%s\n' "$PROJ_ABS_REAL"
+  fi
+}
+spawn_path_real() {  # <path> -> that path's canonical form, from the pane's own vantage point
+  local path=$1
+  if [ "$BACKEND" = podman ]; then
+    podman exec "$FM_BACKEND_PODMAN_CONTAINER" sh -c 'cd "$1" 2>/dev/null && pwd -P' -- "$path" 2>/dev/null || printf '%s\n' "$path"
+  else
+    real_path_or_raw "$path"
+  fi
+}
+spawn_git_toplevel() {  # <path> -> git -C <path> rev-parse --show-toplevel, from the pane's own vantage point
+  local path=$1
+  if [ "$BACKEND" = podman ]; then
+    podman exec "$FM_BACKEND_PODMAN_CONTAINER" git -C "$path" rev-parse --show-toplevel 2>/dev/null || true
+  else
+    git -C "$path" rev-parse --show-toplevel 2>/dev/null || true
+  fi
+}
+
 # Session-provider container-ensure + task creation. tmux stays exactly as P1
 # left it (same session-name / new-window sequence, see bin/backends/tmux.sh);
 # a herdr spawn goes through the version-gated, workspace-per-HOME,
@@ -789,15 +821,12 @@ real_path_or_raw() {  # <path>
 # per-backend routing (fm_backend_resolve_selector).
 validate_spawn_worktree() {  # <source> <inspect-target>
   local source=$1 inspect_target=$2 wt_real proj_real wt_top wt_top_real
-  wt_real=
-  if ! wt_real=$(cd "$WT" 2>/dev/null && pwd -P); then
-    wt_real=
-  fi
-  proj_real=$PROJ_ABS_REAL
-  wt_top=$(git -C "$WT" rev-parse --show-toplevel 2>/dev/null || true)
+  wt_real=$(spawn_path_real "$WT")
+  proj_real=$(spawn_baseline_real)
+  wt_top=$(spawn_git_toplevel "$WT")
   wt_top_real=
-  if ! wt_top_real=$(cd "$wt_top" 2>/dev/null && pwd -P); then
-    wt_top_real=
+  if [ -n "$wt_top" ]; then
+    wt_top_real=$(spawn_path_real "$wt_top")
   fi
   if [ -z "$wt_real" ] || [ -z "$wt_top_real" ] || [ "$wt_real" != "$wt_top_real" ] || [ "$wt_real" = "$proj_real" ]; then
     echo "error: $source did not yield an isolated worktree (resolved '$WT'; worktree root '${wt_top:-none}'; primary '$PROJ_ABS'); refusing to launch to avoid tangling the primary checkout. Inspect target $inspect_target" >&2
@@ -1076,11 +1105,12 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   # pane that is already settled by the first real read only costs the one existing
   # inter-poll sleep as confirmation, not a whole extra cycle on top.
   candidate=""
+  wt_baseline=$(spawn_baseline_real)
   for _ in $(seq 1 60); do
     p=$(spawn_current_path "$WT_TARGET" || true)
     if [ -n "$p" ]; then
-      p_real=$(real_path_or_raw "$p")
-      if [ "$p_real" != "$PROJ_ABS_REAL" ]; then
+      p_real=$(spawn_path_real "$p")
+      if [ "$p_real" != "$wt_baseline" ]; then
         if [ -n "$candidate" ] && [ "$p_real" = "$candidate" ]; then
           WT="$p"
           break
@@ -1275,7 +1305,21 @@ META_WINDOW=$T
 } > "$STATE/$ID.meta"
 [ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
 
-sq_brief=$(shell_quote "$BRIEF")
+BRIEF_FOR_LAUNCH=$BRIEF
+if [ "$BACKEND" = podman ]; then
+  # The brief lives under this firstmate home's data/ dir (FM_HOME), which
+  # for an ordinary (non-self-hosted) project is a different filesystem
+  # entirely from proj_abs/FM_BACKEND_PODMAN_MOUNT - a podman crewmate's
+  # container has no path in common with the primary's own filesystem, so
+  # the host-side $BRIEF path is never reachable from inside it. Copy the
+  # brief's content into the container instead of assuming a shared path.
+  if ! podman cp "$BRIEF" "$PODMAN_CONTAINER:/home/agent/.fm-brief.md" >/dev/null 2>&1; then
+    echo "error: failed to copy brief into podman container '$PODMAN_CONTAINER'" >&2
+    exit 1
+  fi
+  BRIEF_FOR_LAUNCH=/home/agent/.fm-brief.md
+fi
+sq_brief=$(shell_quote "$BRIEF_FOR_LAUNCH")
 sq_turnend=$(shell_quote "$TURNEND")
 sq_piext=$(shell_quote "$STATE/$ID.pi-ext.ts")
 sq_piturnend=$(shell_quote "$PROJ_ABS/.pi/extensions/fm-primary-turnend-guard.ts")

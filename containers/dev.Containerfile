@@ -7,15 +7,15 @@
 # Scope: a plain, non-root shell environment with tmux (this adapter's own
 # in-container event-source plumbing - see bin/backends/podman.sh's file
 # header), git/gh, treehouse (for the worktree-isolation step every ship/
-# scout spawn requires), and Claude Code as the one baked-in harness for
-# now (other harnesses remain a captain decision; see docs/podman-backend.md
-# "Open questions").
+# scout spawn requires), no-mistakes (for the no-mistakes delivery mode),
+# and Claude Code as the one baked-in harness for now (other harnesses
+# remain a captain decision; see docs/podman-backend.md "Open questions").
 FROM debian:12-slim
 LABEL firstmate.managed=true
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
-     tmux git ca-certificates curl openssh-client gnupg \
+     tmux git ca-certificates curl openssh-client gnupg procps \
   && rm -rf /var/lib/apt/lists/*
 
 # GitHub CLI (gh) - apt.github.com because Debian's own repo lags behind.
@@ -35,10 +35,13 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 
 RUN npm install -g @anthropic-ai/claude-code
 
-# treehouse installs as root (its installer shells out to sudo when not
-# root, which isn't present in this slim image) so the binary lands in a
-# system path shared by every user.
+# treehouse and no-mistakes install as root (their installers shell out to
+# sudo when not root, which isn't present in this slim image) so the
+# binaries land in a system path shared by every user.
 RUN curl -fsSL https://kunchenguid.github.io/treehouse/install.sh | sh
+RUN curl -fsSL https://raw.githubusercontent.com/kunchenguid/no-mistakes/main/docs/install.sh | sh \
+  && chmod o+x /root \
+  && chmod -R o+rX /root/.no-mistakes
 
 # The project bind mount is owned by whatever uid runs podman on the host,
 # which almost never matches this image's "agent" uid, so git's ownership

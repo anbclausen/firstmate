@@ -128,6 +128,39 @@ if [ "$BACKEND" = orca ]; then
   T_ORCA=$(grep '^terminal=' "$META" | tail -1 | cut -d= -f2- || true)
   [ -n "$T_ORCA" ] && T=$T_ORCA
 fi
+PODMAN_CONTAINER=""
+[ "$BACKEND" = podman ] && PODMAN_CONTAINER=$(grep '^podman_container=' "$META" | cut -d= -f2- || true)
+# teardown_wt_git: every landed-work/uncommitted-change check below reads the
+# worktree through `teardown_wt_git`, which only works when the caller shares a
+# filesystem with $WT. A podman task's worktree lives inside its own
+# container, invisible to the primary's own `git` - $WT there is already the
+# CONTAINER-INTERNAL path (see bin/fm-spawn.sh's podman branch), so no path
+# translation is needed, just routing the same command through `podman exec`.
+teardown_wt_git() {
+  if [ "$BACKEND" = podman ]; then
+    podman exec "$PODMAN_CONTAINER" git -C "$WT" "$@"
+  else
+    git -C "$WT" "$@"
+  fi
+}
+# teardown_wt_dir_exists: `[ -d "$WT" ]` only ever checks the PRIMARY's own
+# filesystem, which a podman task's worktree (inside its own container) is
+# never on - every such guard silently read as false and skipped its whole
+# branch, so podman task teardown never even reached its worktree cleanup.
+teardown_wt_dir_exists() {
+  if [ "$BACKEND" = podman ]; then
+    [ -n "$PODMAN_CONTAINER" ] && podman exec "$PODMAN_CONTAINER" test -d "$WT" 2>/dev/null
+  else
+    [ -d "$WT" ]
+  fi
+}
+teardown_wt_rm_hooks() {
+  if [ "$BACKEND" = podman ]; then
+    podman exec "$PODMAN_CONTAINER" rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend" 2>/dev/null || true
+  else
+    rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend"
+  fi
+}
 HOME_PATH=$(grep '^home=' "$META" | cut -d= -f2- || true)
 PR_URL=$(grep '^pr=' "$META" | tail -1 | cut -d= -f2- || true)
 # tasktmp is recorded by fm-spawn for tasks that set up a per-task temp root
@@ -297,26 +330,26 @@ pr_number_from_target() {
 
 ensure_commit_object() {
   local target=$1 commit=$2 n
-  git -C "$WT" cat-file -e "$commit^{commit}" 2>/dev/null && return 0
+  teardown_wt_git cat-file -e "$commit^{commit}" 2>/dev/null && return 0
   n=$(pr_number_from_target "$target") || return 1
-  git -C "$WT" remote get-url origin >/dev/null 2>&1 || return 1
-  git -C "$WT" fetch --quiet origin "refs/pull/$n/head" >/dev/null 2>&1 || return 1
-  git -C "$WT" cat-file -e "$commit^{commit}" 2>/dev/null
+  teardown_wt_git remote get-url origin >/dev/null 2>&1 || return 1
+  teardown_wt_git fetch --quiet origin "refs/pull/$n/head" >/dev/null 2>&1 || return 1
+  teardown_wt_git cat-file -e "$commit^{commit}" 2>/dev/null
 }
 
 patch_id_for_commit() {
   local commit=$1
-  git -C "$WT" show --pretty=medium --no-ext-diff "$commit" 2>/dev/null \
+  teardown_wt_git show --pretty=medium --no-ext-diff "$commit" 2>/dev/null \
     | git patch-id --stable 2>/dev/null \
     | awk 'NR == 1 { print $1 }'
 }
 
 unpushed_patches_are_in_pr_head() {
   local pr_head=$1 current base pr_patch_ids commit patch_id unpushed
-  current=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null) || return 1
-  base=$(git -C "$WT" merge-base "$current" "$pr_head" 2>/dev/null) || return 1
+  current=$(teardown_wt_git rev-parse --verify HEAD 2>/dev/null) || return 1
+  base=$(teardown_wt_git merge-base "$current" "$pr_head" 2>/dev/null) || return 1
   pr_patch_ids=$(
-    git -C "$WT" log --format=%H "$base..$pr_head" -- 2>/dev/null \
+    teardown_wt_git log --format=%H "$base..$pr_head" -- 2>/dev/null \
       | while IFS= read -r commit; do
           patch_id_for_commit "$commit"
         done \
@@ -324,7 +357,7 @@ unpushed_patches_are_in_pr_head() {
       | sort -u
   ) || return 1
   [ -n "$pr_patch_ids" ] || return 1
-  unpushed=$(git -C "$WT" log --format=%H HEAD --not --remotes -- 2>/dev/null) || return 1
+  unpushed=$(teardown_wt_git log --format=%H HEAD --not --remotes -- 2>/dev/null) || return 1
   [ -n "$unpushed" ] || return 1
   while IFS= read -r commit; do
     [ -n "$commit" ] || continue
@@ -359,8 +392,8 @@ pr_is_merged() {
   esac
   [ -n "$head" ] || return 1
   ensure_commit_object "$target" "$head" || return 1
-  current=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null) || return 1
-  git -C "$WT" merge-base --is-ancestor "$current" "$head" 2>/dev/null && return 0
+  current=$(teardown_wt_git rev-parse --verify HEAD 2>/dev/null) || return 1
+  teardown_wt_git merge-base --is-ancestor "$current" "$head" 2>/dev/null && return 0
   unpushed_patches_are_in_pr_head "$head"
 }
 
@@ -374,17 +407,17 @@ pr_is_merged() {
 content_in_default() {
   local name ref default_tree merged_tree
   name=$(default_branch) || return 1
-  if git -C "$WT" remote get-url origin >/dev/null 2>&1; then
-    git -C "$WT" fetch --quiet origin "+refs/heads/$name:refs/remotes/origin/$name" >/dev/null 2>&1 || return 1
+  if teardown_wt_git remote get-url origin >/dev/null 2>&1; then
+    teardown_wt_git fetch --quiet origin "+refs/heads/$name:refs/remotes/origin/$name" >/dev/null 2>&1 || return 1
     ref="refs/remotes/origin/$name"
-  elif git -C "$WT" rev-parse --quiet --verify "refs/heads/$name" >/dev/null 2>&1; then
+  elif teardown_wt_git rev-parse --quiet --verify "refs/heads/$name" >/dev/null 2>&1; then
     ref="refs/heads/$name"
   else
     return 1
   fi
-  default_tree=$(git -C "$WT" rev-parse --quiet --verify "$ref^{tree}" 2>/dev/null) || return 1
+  default_tree=$(teardown_wt_git rev-parse --quiet --verify "$ref^{tree}" 2>/dev/null) || return 1
   [ -n "$default_tree" ] || return 1
-  merged_tree=$(git -C "$WT" merge-tree --write-tree "$ref" HEAD 2>/dev/null) || return 1
+  merged_tree=$(teardown_wt_git merge-tree --write-tree "$ref" HEAD 2>/dev/null) || return 1
   merged_tree=$(printf '%s\n' "$merged_tree" | head -1)
   [ "$merged_tree" = "$default_tree" ]
 }
@@ -567,15 +600,31 @@ cleanup_stale_lock_for_safety_check() {
   return "$TEARDOWN_TREEHOUSE_LOCK_REFUSED"
 }
 
+# _th_return_attempt: one `treehouse return --force <dir>` attempt, local or
+# (when th_backend/th_container are set) inside a podman crewmate's own
+# container - `podman exec` inherits the image's WORKDIR (/work, the project
+# mount), the same role cd_dir plays for the local case, so no explicit -w is
+# needed. Only the current task's OWN worktree (the "$WT"/"$BACKEND" call site
+# below) ever passes these; secondmate-home and child-worktree returns stay
+# local since this script does not currently track a child task's own backend.
+_th_return_attempt() {
+  local dir=$1 cd_dir=$2 th_backend=$3 th_container=$4
+  if [ "$th_backend" = podman ]; then
+    podman exec "$th_container" treehouse return --force "$dir" 2>&1
+  else
+    ( cd "$cd_dir" && treehouse return --force "$dir" ) 2>&1
+  fi
+}
+
 # Return a worktree/home via `treehouse return --force`, tolerating a transient or
 # stale git index.lock left by a killed crew process. See the script header.
 teardown_treehouse_return() {
-  local dir=$1 cd_dir=$2 label=$3 post_cleanup_check=${4:-}
+  local dir=$1 cd_dir=$2 label=$3 post_cleanup_check=${4:-} th_backend=${5:-} th_container=${6:-}
   local out lock attempt=0 max_retries lock_desc
 
   # Capture stdout+stderr so non-lock failures stay visible and lock failures can
   # be matched by signature even when the lock file is already gone mid-check.
-  if out=$( ( cd "$cd_dir" && treehouse return --force "$dir" ) 2>&1 ); then
+  if out=$(_th_return_attempt "$dir" "$cd_dir" "$th_backend" "$th_container"); then
     [ -n "$out" ] && printf '%s\n' "$out"
     return 0
   fi
@@ -600,7 +649,7 @@ teardown_treehouse_return() {
     echo "teardown: $label return failed with transient git lock ($lock_desc); waiting ${TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS}s and retrying ($attempt/${max_retries})" >&2
     sleep "$TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS"
 
-    if out=$( ( cd "$cd_dir" && treehouse return --force "$dir" ) 2>&1 ); then
+    if out=$(_th_return_attempt "$dir" "$cd_dir" "$th_backend" "$th_container"); then
       [ -n "$out" ] && printf '%s\n' "$out"
       echo "teardown: $label return succeeded on retry; lock cleared on its own" >&2
       return 0
@@ -627,7 +676,7 @@ teardown_treehouse_return() {
           return 1
         fi
       fi
-      if out=$( ( cd "$cd_dir" && treehouse return --force "$dir" ) 2>&1 ); then
+      if out=$(_th_return_attempt "$dir" "$cd_dir" "$th_backend" "$th_container"); then
         [ -n "$out" ] && printf '%s\n' "$out"
         echo "teardown: $label return succeeded after stale-lock cleanup" >&2
         return 0
@@ -647,13 +696,13 @@ teardown_treehouse_return() {
 
 validate_worktree_teardown_safety() {
   local dirty_raw dirty unpushed_raw unpushed DEFAULT unmerged_raw unmerged branch
-  [ -d "$WT" ] || return 0
+  teardown_wt_dir_exists || return 0
   [ "$FORCE" != "--force" ] || return 0
   case "$KIND" in
     secondmate|scout) return 0 ;;
   esac
 
-  if ! dirty_raw=$(git -C "$WT" status --porcelain 2>/dev/null); then
+  if ! dirty_raw=$(teardown_wt_git status --porcelain 2>/dev/null); then
     if worktree_safety_blocked_by_lock "uncommitted changes"; then
       return "$TEARDOWN_WORKTREE_SAFETY_LOCK_BLOCKED"
     fi
@@ -663,7 +712,7 @@ validate_worktree_teardown_safety() {
   fi
   dirty=$(printf '%s\n' "$dirty_raw" | grep -vE '^\?\? (\.claude/|\.fm-grok-turnend$)' | head -1 || true)
 
-  if ! unpushed_raw=$(git -C "$WT" log --oneline HEAD --not --remotes -- 2>/dev/null); then
+  if ! unpushed_raw=$(teardown_wt_git log --oneline HEAD --not --remotes -- 2>/dev/null); then
     if worktree_safety_blocked_by_lock "commits not on a remote"; then
       return "$TEARDOWN_WORKTREE_SAFETY_LOCK_BLOCKED"
     fi
@@ -675,7 +724,7 @@ validate_worktree_teardown_safety() {
 
   if [ -n "$unpushed" ] && [ "$MODE" = local-only ]; then
     DEFAULT=$(default_branch) || { echo "REFUSED: cannot determine default branch for $PROJ; expected origin/HEAD, main, or master." >&2; return 1; }
-    if ! unmerged_raw=$(git -C "$WT" log --oneline HEAD --not "$DEFAULT" -- 2>/dev/null); then
+    if ! unmerged_raw=$(teardown_wt_git log --oneline HEAD --not "$DEFAULT" -- 2>/dev/null); then
       if worktree_safety_blocked_by_lock "commits not on $DEFAULT"; then
         return "$TEARDOWN_WORKTREE_SAFETY_LOCK_BLOCKED"
       fi
@@ -699,7 +748,7 @@ validate_worktree_teardown_safety() {
   elif [ -n "$unpushed" ]; then
     branch=${TEARDOWN_WORKTREE_BRANCH_FOR_SAFETY:-}
     if [ -z "$branch" ]; then
-      branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
+      branch=$(teardown_wt_git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
       TEARDOWN_WORKTREE_BRANCH_FOR_SAFETY=$branch
     fi
     if ! work_is_landed "$branch"; then
@@ -1076,7 +1125,7 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ] &&
   ORCA_PATH_MATCH_VERIFIED=1
 fi
 
-if [ -d "$WT" ] && [ "$FORCE" != "--force" ]; then
+if teardown_wt_dir_exists && [ "$FORCE" != "--force" ]; then
   if validate_worktree_teardown_safety; then
     :
   else
@@ -1096,26 +1145,26 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
     require_orca_worktree_path_match_if_present "$ORCA_WORKTREE_ID" "$WT" || exit 1
     ORCA_PATH_MATCH_VERIFIED=1
   fi
-  if [ -d "$WT" ]; then
-    branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
+  if teardown_wt_dir_exists; then
+    branch=$(teardown_wt_git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
     if [ "$branch" != "HEAD" ]; then
-      if git -C "$WT" checkout --detach -q 2>/dev/null; then
-        git -C "$WT" branch -D "$branch" >/dev/null 2>&1 || true
+      if teardown_wt_git checkout --detach -q 2>/dev/null; then
+        teardown_wt_git branch -D "$branch" >/dev/null 2>&1 || true
       fi
     fi
     rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend"
   fi
   [ -z "$T_ORCA" ] || fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" 2>/dev/null || true
   fm_backend_remove_worktree "$BACKEND" "$ORCA_WORKTREE_ID"
-elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
-  branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
+elif teardown_wt_dir_exists && [ "$KIND" != secondmate ]; then
+  branch=$(teardown_wt_git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
   if [ "$branch" != "HEAD" ]; then
-    if git -C "$WT" checkout --detach -q 2>/dev/null; then
-      git -C "$WT" branch -D "$branch" >/dev/null 2>&1 || true
+    if teardown_wt_git checkout --detach -q 2>/dev/null; then
+      teardown_wt_git branch -D "$branch" >/dev/null 2>&1 || true
     fi
   fi
   # Remove our hook file so a reused pool worktree cannot fire signals for a dead task.
-  rm -f "$WT/.claude/settings.local.json" "$WT/.opencode/plugins/fm-turn-end.js" "$WT/.fm-grok-turnend"
+  teardown_wt_rm_hooks
   # Kills remaining processes in the worktree (including the agent), resets, returns
   # to pool. treehouse resolves the pool from the working directory, so run it from
   # the project. teardown_treehouse_return tolerates transient and stale git locks
@@ -1124,7 +1173,7 @@ elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   if [ "$FORCE" != "--force" ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ]; then
     post_lock_cleanup_check=validate_worktree_teardown_safety
   fi
-  teardown_treehouse_return "$WT" "$PROJ" "worktree" "$post_lock_cleanup_check" || {
+  teardown_treehouse_return "$WT" "$PROJ" "worktree" "$post_lock_cleanup_check" "$BACKEND" "$PODMAN_CONTAINER" || {
     echo "error: treehouse return failed for worktree $WT; teardown aborted" >&2
     exit 1
   }

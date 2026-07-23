@@ -404,14 +404,17 @@ fm_backend_podman_send_text_submit() {  # <target> <text> <retries> <enter-sleep
 # whole sandbox in one step - unlike the multiplexer backends there is no
 # separate "session" to leave behind.
 fm_backend_podman_kill() {  # <target> [unused] [expected-label]
-  local expected_label=${3:-} name
-  if [ -n "$expected_label" ]; then
-    fm_backend_podman_target_ready "$1" "$expected_label" || return 0
-    name=$FM_BACKEND_PODMAN_CONTAINER
-  else
-    fm_backend_podman_parse_target "$1" || return 0
-    name=$FM_BACKEND_PODMAN_CONTAINER
-  fi
+  local name
+  # Killing the container must not depend on fm_backend_podman_target_ready
+  # (container running AND its in-container tmux session alive): a prior
+  # `treehouse return --force` worktree release kills every process under
+  # that tmux session, including the tmux SERVER itself, which the container's
+  # own top-level process (`sleep infinity`) survives independently of. Gating
+  # kill on tmux-session liveness made it silently no-op after every ordinary
+  # teardown - the container was never actually removed. Only the target
+  # STRING needs parsing here, not any liveness proof.
+  fm_backend_podman_parse_target "$1" || return 0
+  name=$FM_BACKEND_PODMAN_CONTAINER
   podman stop -t 5 "$name" >/dev/null 2>&1 || true
   podman rm -f "$name" >/dev/null 2>&1 || true
 }

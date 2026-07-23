@@ -32,7 +32,10 @@ pub fn relaunch_into_runtime(root: &Path) -> anyhow::Result<()> {
     // we build the runtime image ourselves whenever it isn't already cached.
     let build_override = env::var("FM_TUI_PODMAN_BUILD").ok();
     if build_override.is_some() || !image_exists(RUNTIME_IMAGE) {
-        let cmd = build_override.unwrap_or_else(|| default_build_command(root));
+        let cmd = match build_override {
+            Some(s) => s.split_whitespace().map(String::from).collect(),
+            None => default_build_command(root),
+        };
         println!("firstmate TUI: building the runtime image (cached after first launch)...");
         run_build_or_crash(&cmd)?;
     }
@@ -40,20 +43,26 @@ pub fn relaunch_into_runtime(root: &Path) -> anyhow::Result<()> {
     exec_runtime(root)
 }
 
-fn default_build_command(root: &Path) -> String {
-    format!(
-        "podman build -t {RUNTIME_IMAGE} -f {}/tui/runtime.Containerfile {}",
-        root.display(),
-        root.display(),
-    )
+/// Returns the full `podman build ...` argv (program included) as separate
+/// words, rather than one shell string, so a repo path containing a space
+/// isn't mis-split later by whitespace parsing.
+fn default_build_command(root: &Path) -> Vec<String> {
+    vec![
+        "podman".to_string(),
+        "build".to_string(),
+        "-t".to_string(),
+        RUNTIME_IMAGE.to_string(),
+        "-f".to_string(),
+        format!("{}/tui/runtime.Containerfile", root.display()),
+        root.display().to_string(),
+    ]
 }
 
-fn run_build_or_crash(build_cmd: &str) -> anyhow::Result<()> {
-    let mut parts = build_cmd.split_whitespace();
-    let program = parts
-        .next()
+fn run_build_or_crash(build_cmd: &[String]) -> anyhow::Result<()> {
+    let program = build_cmd
+        .first()
         .ok_or_else(|| anyhow::anyhow!("empty build command"))?;
-    let args: Vec<&str> = parts.collect();
+    let args: Vec<&str> = build_cmd[1..].iter().map(String::as_str).collect();
     let outcome = loading::run_build_command(program, &args)?;
     if !outcome.success {
         loading::crash_with_build_log(&outcome.log);
@@ -103,20 +112,30 @@ fn ensure_podman_machine_running() {
 /// machine VM, since podman reports whichever filesystem the daemon itself
 /// sees - unlike hand-constructing the path, this needs no VM-vs-native
 /// branch (see the retired run.sh for the VM-ssh approach this replaces).
-fn podman_socket_path() -> Option<String> {
+/// Returns an error rather than degrading silently, since a container
+/// launched without this mount can't see sibling crewmate containers at all.
+fn podman_socket_path() -> anyhow::Result<String> {
     let output = Command::new("podman")
         .args(["info", "--format", "{{.Host.RemoteSocket.Path}}"])
         .output()
-        .ok()?;
+        .map_err(|e| anyhow::anyhow!("failed to run `podman info` to resolve the podman socket path: {e}"))?;
     if !output.status.success() {
-        return None;
+        anyhow::bail!(
+            "`podman info` failed while resolving the podman socket path; \
+             refusing to relaunch without sibling-container visibility"
+        );
     }
-    let path = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    let path = String::from_utf8(output.stdout)
+        .map_err(|e| anyhow::anyhow!("`podman info` output was not valid UTF-8: {e}"))?
+        .trim()
+        .to_string();
     if path.is_empty() {
-        None
-    } else {
-        Some(path)
+        anyhow::bail!(
+            "podman reported an empty socket path; \
+             refusing to relaunch without sibling-container visibility"
+        );
     }
+    Ok(path)
 }
 
 fn exec_runtime(root: &Path) -> anyhow::Result<()> {
@@ -161,16 +180,10 @@ fn exec_runtime(root: &Path) -> anyhow::Result<()> {
         .arg("-w")
         .arg(&root_str);
 
-    if let Some(sock) = podman_socket_path() {
-        cmd.arg("-v")
-            .arg(format!("{sock}:/run/podman/podman.sock"))
-            .args(["-e", "CONTAINER_HOST=unix:///run/podman/podman.sock"]);
-    } else {
-        eprintln!(
-            "firstmate TUI: warning: could not resolve the podman socket; \
-             sibling crewmate containers won't be visible from inside."
-        );
-    }
+    let sock = podman_socket_path()?;
+    cmd.arg("-v")
+        .arg(format!("{sock}:/run/podman/podman.sock"))
+        .args(["-e", "CONTAINER_HOST=unix:///run/podman/podman.sock"]);
 
     if let Some(home) = env::var_os("HOME") {
         let home = Path::new(&home);
@@ -213,8 +226,23 @@ mod tests {
         let cmd = default_build_command(Path::new("/repo"));
         assert_eq!(
             cmd,
-            "podman build -t fm-tui-runtime -f /repo/tui/runtime.Containerfile /repo"
+            vec![
+                "podman",
+                "build",
+                "-t",
+                "fm-tui-runtime",
+                "-f",
+                "/repo/tui/runtime.Containerfile",
+                "/repo",
+            ]
         );
+    }
+
+    #[test]
+    fn default_build_command_keeps_a_spaced_repo_path_as_one_argument() {
+        let cmd = default_build_command(Path::new("/repo with space"));
+        assert_eq!(cmd.last().unwrap(), "/repo with space");
+        assert_eq!(cmd.len(), 7);
     }
 
     #[test]

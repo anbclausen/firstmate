@@ -66,3 +66,27 @@ pub fn spawn(
 
     Ok((rx, killer))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// The reader thread blocks in `child.wait()` for the process's full
+    /// lifetime. If `kill()` didn't actually terminate the child, this test
+    /// would hang until the 30s sleep finished (well past the recv timeout)
+    /// instead of observing `Exited` almost immediately.
+    #[test]
+    fn kill_terminates_a_long_running_child_promptly() {
+        let (rx, mut killer) = spawn("sleep", &["30".to_string()]).unwrap();
+
+        killer.kill().unwrap();
+
+        let event = rx.recv_timeout(Duration::from_secs(5));
+        assert!(
+            matches!(event, Ok(ChildEvent::Exited(_))),
+            "expected the child to exit promptly after kill(), got {:?} instead",
+            event.is_ok()
+        );
+    }
+}

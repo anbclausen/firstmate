@@ -45,6 +45,7 @@ struct App {
     transcript: Vec<String>,
     decision: Option<DecisionBox>,
     child_rx: Option<std::sync::mpsc::Receiver<ChildEvent>>,
+    child_killer: Option<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
     harness: Option<Harness>,
 }
 
@@ -56,6 +57,7 @@ impl App {
             transcript: Vec::new(),
             decision: None,
             child_rx: None,
+            child_killer: None,
             harness: None,
         }
     }
@@ -67,8 +69,9 @@ impl App {
         }
         self.harness = Some(harness);
         match child::spawn(harness.command(), &[]) {
-            Ok(rx) => {
+            Ok((rx, killer)) => {
                 self.child_rx = Some(rx);
+                self.child_killer = Some(killer);
                 self.head.set_state(HeadState::Idle);
             }
             Err(err) => {
@@ -76,6 +79,14 @@ impl App {
             }
         }
         self.mode = Mode::Running;
+    }
+
+    /// Terminates the wrapped harness process, if one is running, so it
+    /// doesn't keep running detached after the TUI exits.
+    fn kill_child(&mut self) {
+        if let Some(killer) = &mut self.child_killer {
+            let _ = killer.kill();
+        }
     }
 
     fn poll_child(&mut self) {
@@ -106,10 +117,9 @@ impl App {
 fn main() -> anyhow::Result<()> {
     let root = repo_root();
     let mut app = App::new();
-    let first_run = config::load_default_harness(&root).is_none();
-    if let Some(harness) = config::load_default_harness(&root) {
-        app.harness = Some(harness);
-    }
+    let default_harness = config::load_default_harness(&root);
+    let first_run = default_harness.is_none();
+    app.harness = default_harness;
 
     // Loading screen: shown on first launch, and whenever the environment
     // asks for a podman image build/pull to run first (see loading.rs and
@@ -204,7 +214,10 @@ fn run(
                             let chosen = Harness::ALL[*selected];
                             app.start_harness(root, chosen);
                         }
-                        KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
+                        KeyCode::Esc | KeyCode::Char('q') => {
+                            app.kill_child();
+                            return Ok(());
+                        }
                         _ => {}
                     },
                     Mode::Running => {
@@ -218,10 +231,14 @@ fn run(
                                     app.decision = None;
                                     app.head.set_state(HeadState::Idle);
                                 }
-                                KeyCode::Esc => return Ok(()),
+                                KeyCode::Esc => {
+                                    app.kill_child();
+                                    return Ok(());
+                                }
                                 _ => {}
                             }
                         } else if key.code == KeyCode::Esc || key.code == KeyCode::Char('q') {
+                            app.kill_child();
                             return Ok(());
                         }
                     }

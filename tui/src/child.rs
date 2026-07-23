@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader};
 use std::sync::mpsc::{channel, Receiver};
 use std::thread;
 
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, PtySize};
 
 use crate::decision::{parse_line, Decision};
 
@@ -17,10 +17,14 @@ pub enum ChildEvent {
     Exited(i32),
 }
 
-/// Spawns `command` on a pty and returns a receiver of its output events.
-/// The reader thread runs for the lifetime of the child; the channel closes
-/// when the child exits and its output is fully drained.
-pub fn spawn(command: &str, args: &[String]) -> anyhow::Result<Receiver<ChildEvent>> {
+/// Spawns `command` on a pty and returns a receiver of its output events
+/// plus a killer handle that can terminate the child independently of the
+/// reader thread, which otherwise blocks in `child.wait()` for the
+/// lifetime of the process.
+pub fn spawn(
+    command: &str,
+    args: &[String],
+) -> anyhow::Result<(Receiver<ChildEvent>, Box<dyn ChildKiller + Send + Sync>)> {
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(PtySize {
         rows: 40,
@@ -33,6 +37,8 @@ pub fn spawn(command: &str, args: &[String]) -> anyhow::Result<Receiver<ChildEve
     cmd.args(args);
     let mut child = pair.slave.spawn_command(cmd)?;
     drop(pair.slave);
+
+    let killer = child.clone_killer();
 
     let reader = pair.master.try_clone_reader()?;
     let (tx, rx) = channel();
@@ -58,5 +64,5 @@ pub fn spawn(command: &str, args: &[String]) -> anyhow::Result<Receiver<ChildEve
         let _ = tx.send(ChildEvent::Exited(code));
     });
 
-    Ok(rx)
+    Ok((rx, killer))
 }

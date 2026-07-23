@@ -30,11 +30,15 @@
 # docs/codex-app-backend.md owns that blocked backend contract.
 #
 # Compatibility contract: a task's meta may omit `backend=`; every reader here
-# treats that as `tmux` (fm_backend_of_meta), and fm-spawn.sh does not write
-# `backend=tmux` for a default-backend task, so existing and newly spawned
-# default-path metas stay byte-identical. Only a task spawned on a non-tmux
-# spawn-capable backend, currently experimental herdr, zellij, orca, or cmux,
-# carries an explicit `backend=` line.
+# treats that as `tmux` (fm_backend_of_meta). That used to also describe every
+# NEWLY spawned default-path task, since fm-spawn.sh skipped writing
+# `backend=tmux` when tmux was the ultimate fallback default. This fork's
+# fallback default is now podman (see fm_backend_name below), and "absent
+# means tmux" cannot simply become "absent means podman" without silently
+# misreading every pre-existing tmux-era meta - so fm-spawn.sh now always
+# writes `backend=` explicitly for every new spawn, on every backend
+# including tmux. Absent `backend=` in fm_backend_of_meta only ever means a
+# genuinely old task now, never "whatever today's default is".
 #
 # Event-source framing (herdr-addendum "Events as the core abstraction"): a
 # backend's supervision surface is conceptually an EVENT SOURCE - it produces
@@ -235,16 +239,24 @@ fm_backend_detect_cmux_app_is_ancestor() {
 # fm_backend_name: resolve the ACTIVE backend for a NEW spawn, absent an
 # explicit per-task override. Precedence: FM_BACKEND env, then config/backend
 # (a single word on its first non-empty line, mirroring config/crew-harness),
-# then runtime auto-detection (fm_backend_detect), then default tmux. A
-# per-task `--backend` flag is parsed by the caller (fm-spawn.sh) and takes
+# then runtime auto-detection (fm_backend_detect), then the fallback default.
+# A per-task `--backend` flag is parsed by the caller (fm-spawn.sh) and takes
 # precedence over this resolution entirely; it is not read here. Auto-detect
 # fires only when nothing was explicitly configured, so an explicit setting
 # always wins. Selecting herdr or cmux via auto-detect prints one loud stderr
-# notice (both are experimental); auto-detecting tmux stays silent - it is
-# today's default-path behavior and callers must see zero change. The cmux
-# notice names the winning signal, so a fallback-detected cmux (bundle id or
-# ancestry, after the claude wrapper stripped CMUX_WORKSPACE_ID) is visibly
-# distinct from the primary-marker case.
+# notice (both are experimental); auto-detecting tmux stays silent.
+# The cmux notice names the winning signal, so a fallback-detected cmux
+# (bundle id or ancestry, after the claude wrapper stripped
+# CMUX_WORKSPACE_ID) is visibly distinct from the primary-marker case.
+#
+# THIS FORK's fallback default (nothing explicit, nothing auto-detected) is
+# `podman`, not tmux: this fork's primary runs containerized and as root
+# (--user 0:0, needed for podman-socket access - see run.sh), and a tmux-
+# backend crewmate inherits that root, which breaks `claude
+# --dangerously-skip-permissions` outright (it refuses to run as root). This
+# is a deliberate captain decision for this fork specifically, not a fact
+# about firstmate in general - set config/backend=tmux (or --backend tmux
+# per spawn) to opt back into tmux.
 fm_backend_name() {
   local line v detected marker
   if [ -n "${FM_BACKEND:-}" ]; then
@@ -278,7 +290,7 @@ fm_backend_name() {
     printf '%s' "$detected"
     return 0
   fi
-  printf 'tmux'
+  printf 'podman'
 }
 
 # fm_backend_validate: refuse an unknown backend LOUDLY. Silent on success.

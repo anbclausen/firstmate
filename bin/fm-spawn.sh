@@ -1309,10 +1309,16 @@ META_WINDOW=$T
   echo "tasktmp=$TASK_TMP"
   echo "model=${MODEL:-default}"
   echo "effort=${EFFORT:-default}"
-  # backend= is written only for a non-default (non-tmux) backend, so the
-  # default path's meta stays byte-identical (absent backend= means tmux;
-  # data/fm-backend-design-d7's P1 compatibility contract).
-  [ "$BACKEND" = tmux ] || echo "backend=$BACKEND"
+  # backend= is now always written explicitly. It used to be omitted for
+  # whichever backend was the ultimate fallback default (tmux), relying on
+  # fm_backend_of_meta's "absent means tmux" compatibility contract
+  # (data/fm-backend-design-d7's P1) - but this fork's fallback default is
+  # now podman (bin/fm-backend.sh's fm_backend_name), and that contract
+  # cannot simply be flipped to "absent means podman" without silently
+  # misreading every pre-existing tmux-era meta that predates this change.
+  # Always writing backend= removes the ambiguity going forward; absent
+  # backend= in fm_backend_of_meta now only ever means a genuinely old task.
+  echo "backend=$BACKEND"
   if [ "$BACKEND" = herdr ]; then
     echo "herdr_session=$HERDR_SES"
     echo "herdr_workspace_id=$HERDR_WORKSPACE_ID"

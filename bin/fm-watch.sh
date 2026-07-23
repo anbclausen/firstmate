@@ -221,6 +221,9 @@ window_kind() {
 # window_backend: the backend recorded in the meta whose window= matches <w>,
 # defaulting to tmux (absent backend= means tmux; the P1 compatibility
 # contract) when no matching meta carries the field, or none matches at all.
+# Every new spawn now writes backend= explicitly (bin/fm-spawn.sh), including
+# on this fork's podman default, so this fallback only ever applies to a
+# genuinely old task predating that change.
 window_backend() {
   local w=$1 meta backend
   meta=$(fm_backend_meta_for_window "$w" "$STATE" 2>/dev/null || true)

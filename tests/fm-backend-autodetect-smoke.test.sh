@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tests/fm-backend-autodetect-smoke.test.sh - real herdr smoke test for runtime
 # backend AUTO-DETECTION (bin/fm-backend.sh's fm_backend_detect, wired into
-# fm_backend_name between config/backend and the tmux default).
+# fm_backend_name between config/backend and the fallback default).
 #
 # Unlike tests/fm-backend-herdr.test.sh (fake herdr CLI) and
 # tests/fm-backend-herdr-smoke.test.sh (real herdr, adapter primitives called

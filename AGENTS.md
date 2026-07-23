@@ -73,6 +73,7 @@ config/cmux-socket-password  optional cmux control-socket password; LOCAL, gitig
 config/wedge-alarm  optional away-mode wedge-alarm active-alert directives; LOCAL, gitignored; absent means auto (macOS Notification Center when available); see docs/wedge-alarm.md
 config/private-context-repo  optional private GitHub repo URL for durable private context; LOCAL, gitignored, one line; absent = bootstrap prints a one-time advisory to set it up (docs/configuration.md "Private context repo"); when cloned, holds captain-owned captains-notes.md (read-only for firstmate absent explicit consent) and firstmate-owned notes-on-captain.md
 config/x-mode.env    generated X-mode watcher cadence; LOCAL, gitignored; source before arming watcher when present
+config/tui-harness   captain's chosen harness for the standalone `tui/` crate's first-run picker; LOCAL, gitignored; see `tui/README.md` for the contract
 data/                personal fleet records; LOCAL, gitignored as a whole
   backlog.md         task queue, dependencies, history
   captain.md         this home's domain-local captain preferences and working style; LOCAL, gitignored, canonical even if harness memory mirrors it, and updated with inspect-then-update

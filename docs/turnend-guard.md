@@ -4,8 +4,8 @@ This is the authoritative contract for the "no turn ends blind" primary guard re
 The turn-end supervision predicate lives in `bin/fm-turnend-guard.sh`.
 Its primary-checkout scope lives in `bin/fm-primary-scope-lib.sh`, shared with the native session-start nudge documented in `docs/sessionstart-nudge.md`.
 Harness-specific tracked hook files only adapt each verified harness's real turn-end mechanism to that shared predicate.
-Two related but separate PreToolUse seatbelts deny a bad command shape before it runs rather than detecting a blind turn end afterward: the watcher-arm seatbelt (`bin/fm-arm-pretool-check.sh`, `docs/arm-pretool-check.md`) and the cd-guard (`bin/fm-cd-pretool-check.sh`, `docs/cd-guard.md`).
-Each seatbelt's own document defines its scope; they do not share the turn-end guard's marker-aware primary detection.
+Related but separate PreToolUse guards deny a bad tool or command shape before it runs rather than detecting a blind turn end afterward: the watcher-arm seatbelt (`bin/fm-arm-pretool-check.sh`, `docs/arm-pretool-check.md`), the cd-guard (`bin/fm-cd-pretool-check.sh`, `docs/cd-guard.md`), and the primary delegation-shape guard (`bin/fm-subagent-pretool-check.sh`, `docs/subagent-guard.md`).
+Each guard's own document defines its scope; do not infer this guard's scoping, loop safety, or fail-open tradeoffs for its PreToolUse siblings.
 
 ## Gap Closed
 
@@ -54,6 +54,7 @@ Both payloads include `stop_hook_active`; when it is true, the shared guard exit
 
 OpenCode, Pi, and Grok expose passive lifecycle callbacks for this purpose.
 Their adapters fail open at the hook boundary to avoid corrupting a user session, but they force one follow-up turn when the shared predicate blocks.
+Those forced user-role prompts use the canonical `turn-end-guard` operational kind after the U+2063 `FIRSTMATE_OP: ` prefix so Ahoy cannot mistake them for captain-authored boundaries.
 Each adapter carries its own in-process or environment loop guard so the forced follow-up does not recursively schedule another follow-up.
 Pi keeps that latch active across every internal tool turn and clears it only when the generated guard follow-up reaches `agent_settled`, or immediately when follow-up delivery fails.
 If a passive adapter cannot call its SDK method, cannot find `grok`, or cannot recover the Grok session id, it fails open and relies on the pull-based `fm-guard.sh` warning at the next fleet command.

@@ -218,6 +218,7 @@ fm_backend_podman_treehouse_volume() {  # <proj_abs>
 # target string once the tmux session is confirmed up.
 fm_backend_podman_create_task() {  # <label> <proj_abs> <kind>
   local label=$1 proj_abs=$2 kind=$3 name image profile net_flag treehouse_vol
+  local -a GH_TOKEN_ARGS
   name=$(fm_backend_podman_container_name "$label")
   if podman container exists "$name" 2>/dev/null; then
     echo "error: podman container '$name' already exists" >&2
@@ -228,6 +229,14 @@ fm_backend_podman_create_task() {  # <label> <proj_abs> <kind>
   fm_backend_podman_label_args
   FM_BACKEND_PODMAN_LABEL_ARGS+=(--label "firstmate.task=$label")
   treehouse_vol=$(fm_backend_podman_treehouse_volume "$proj_abs")
+  # gh (needed for the no-mistakes push/PR step and any other gh-axi use) has
+  # no credentials inside a fresh crewmate container otherwise - only Claude
+  # Code's own auth gets seeded below. Forwarded as a plain env var (gh reads
+  # GH_TOKEN directly, no file needed) from the primary's own already-set
+  # GH_TOKEN (see run.sh's --env-file). Scout containers never get it: they
+  # run with --network=none, so gh could never reach GitHub anyway.
+  GH_TOKEN_ARGS=()
+  [ -n "${GH_TOKEN:-}" ] && GH_TOKEN_ARGS=(-e "GH_TOKEN=$GH_TOKEN")
   if [ "$profile" = "$FM_BACKEND_PODMAN_SCOUT_PROFILE" ]; then
     # Investigation profile: read-only project mount plus a small rw scratch
     # dir, and no network by default - least privilege for read-mostly work.
@@ -248,7 +257,7 @@ fm_backend_podman_create_task() {  # <label> <proj_abs> <kind>
     # General dev/coding profile: the project clone (and thus the worktree
     # treehouse creates under it) is read-write; nothing else of the host is
     # mounted. Network stays on (bridge) - a coding task needs registries/gh.
-    if ! podman run -d --name "$name" "${FM_BACKEND_PODMAN_RUN_FLAGS[@]}" "${FM_BACKEND_PODMAN_LABEL_ARGS[@]}" \
+    if ! podman run -d --name "$name" "${FM_BACKEND_PODMAN_RUN_FLAGS[@]}" "${FM_BACKEND_PODMAN_LABEL_ARGS[@]}" "${GH_TOKEN_ARGS[@]}" \
       -v "$proj_abs:$FM_BACKEND_PODMAN_MOUNT:rw" \
       -v "$treehouse_vol:/home/agent/.treehouse" \
       --tmpfs /tmp \

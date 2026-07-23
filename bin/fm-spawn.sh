@@ -1351,6 +1351,7 @@ META_WINDOW=$T
 [ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
 
 BRIEF_FOR_LAUNCH=$BRIEF
+OPINPUT_FOR_LAUNCH="$FM_ROOT/bin/fm-operational-input.sh"
 if [ "$BACKEND" = podman ]; then
   # The brief lives under this firstmate home's data/ dir (FM_HOME), which
   # for an ordinary (non-self-hosted) project is a different filesystem
@@ -1363,13 +1364,23 @@ if [ "$BACKEND" = podman ]; then
     exit 1
   fi
   BRIEF_FOR_LAUNCH=/home/agent/.fm-brief.md
+  # __OPINPUT__ (the operational-input CLI every launch template now shells
+  # out to) is likewise a primary-side host path ($FM_ROOT/bin/...), never
+  # reachable from inside a podman crewmate's own container - same class of
+  # bug as the brief above. The script is a single self-contained file (no
+  # sourcing, no dependency on its own location), so copying it in is enough.
+  if ! podman cp "$FM_ROOT/bin/fm-operational-input.sh" "$PODMAN_CONTAINER:/home/agent/.fm-operational-input.sh" >/dev/null 2>&1; then
+    echo "error: failed to copy fm-operational-input.sh into podman container '$PODMAN_CONTAINER'" >&2
+    exit 1
+  fi
+  OPINPUT_FOR_LAUNCH=/home/agent/.fm-operational-input.sh
 fi
 sq_brief=$(shell_quote "$BRIEF_FOR_LAUNCH")
 sq_turnend=$(shell_quote "$TURNEND")
 sq_piext=$(shell_quote "$STATE/$ID.pi-ext.ts")
 sq_piturnend=$(shell_quote "$PROJ_ABS/.pi/extensions/fm-primary-turnend-guard.ts")
 sq_piwatch=$(shell_quote "$PROJ_ABS/.pi/extensions/fm-primary-pi-watch.ts")
-sq_opinput=$(shell_quote "$FM_ROOT/bin/fm-operational-input.sh")
+sq_opinput=$(shell_quote "$OPINPUT_FOR_LAUNCH")
 PIBRIEFENV=
 [ "$HARNESS" != pi ] || PIBRIEFENV="FM_FIRSTMATE_PI_LAUNCH_BRIEF=$sq_brief"
 MODELFLAG=$(model_flag_for_harness "$HARNESS" "$MODEL")

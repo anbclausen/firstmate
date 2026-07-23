@@ -61,7 +61,10 @@ impl App {
     }
 
     fn start_harness(&mut self, root: &std::path::Path, harness: Harness) {
-        let _ = config::save_default_harness(root, harness);
+        if let Err(err) = config::save_default_harness(root, harness) {
+            self.transcript
+                .push(format!("failed to save default harness: {err}"));
+        }
         self.harness = Some(harness);
         match child::spawn(harness.command(), &[]) {
             Ok(rx) => {

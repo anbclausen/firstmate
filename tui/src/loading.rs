@@ -1,7 +1,7 @@
 //! First-launch and podman-image-build loading screen: ASCII-art ship plus a
-//! progress bar. `run.sh` and `firstmate.Containerfile` at the repo root own
-//! the actual podman pull/build flow this eventually hooks into; this module
-//! only owns how the TUI presents that wait and its failure path.
+//! progress bar. `container.rs` owns the actual podman build/relaunch flow
+//! this hooks into; this module only owns how the TUI presents that wait
+//! and its failure path.
 
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};

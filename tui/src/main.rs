@@ -1,5 +1,6 @@
 mod child;
 mod config;
+mod container;
 mod decision;
 mod decision_box;
 mod head;
@@ -116,27 +117,24 @@ impl App {
 
 fn main() -> anyhow::Result<()> {
     let root = repo_root();
+
+    // Bare host invocation: relaunch inside the runtime container (building
+    // it first if needed) so the TUI's real process runs with the same
+    // podman-socket privileges the firstmate primary itself needs. Only
+    // returns on failure - see container.rs.
+    if env::var_os(container::CONTAINERIZED_MARKER).is_none() {
+        return container::relaunch_into_runtime(&root);
+    }
+
     let mut app = App::new();
     let default_harness = config::load_default_harness(&root);
     let first_run = default_harness.is_none();
     app.harness = default_harness;
 
-    // Loading screen: shown on first launch, and whenever the environment
-    // asks for a podman image build/pull to run first (see loading.rs and
-    // run.sh / firstmate.Containerfile for the container boot flow this
-    // eventually hooks into). A failed build/pull crashes with the full log
-    // on stdout rather than swallowing it.
-    if let Ok(build_cmd) = env::var("FM_TUI_PODMAN_BUILD") {
-        let mut parts = build_cmd.split_whitespace();
-        if let Some(program) = parts.next() {
-            let args: Vec<&str> = parts.collect();
-            println!("firstmate TUI: building/pulling podman image...");
-            let outcome = loading::run_build_command(program, &args)?;
-            if !outcome.success {
-                loading::crash_with_build_log(&outcome.log);
-            }
-        }
-    } else if first_run {
+    // First-launch loading screen only; the podman image build/pull itself
+    // already happened in the outer host phase above (container.rs) before
+    // this containerized process ever started.
+    if first_run {
         show_first_run_loading_screen()?;
     }
 

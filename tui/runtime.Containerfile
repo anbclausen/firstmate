@@ -1,13 +1,15 @@
-# firstmate.Containerfile - temporary bootstrap image to run firstmate
-# ITSELF (the primary) inside a podman container, not just spawned
-# crewmates. Scaffolding for the "everything containerized" phase ahead
-# of the TUI; delete alongside root run.sh once the TUI supersedes it.
+# tui/runtime.Containerfile - the container the installed `fm` command
+# relaunches itself into (src/container.rs), replacing the root run.sh /
+# firstmate.Containerfile bootstrap this supersedes. Not the build
+# environment - see tui/Containerfile for that; this image never compiles
+# anything, it only runs the already-compiled binary bind-mounted in at
+# container.rs's own host repo path.
 #
-# Installs the same tool surface bin/fm-bootstrap.sh checks for on the
-# host: tmux/git/gh for fleet plumbing, treehouse for worktrees, the
-# node-based axi tool family, and no-mistakes. Claude Code itself is
-# installed from its npm package rather than the host's brew cask, since
-# the container has no Homebrew.
+# Tool surface matches what the wrapped harness needs to actually act as a
+# firstmate primary (gh/node/axi tools/no-mistakes/treehouse/tmux), plus
+# podman itself so the containerized TUI can reach the bind-mounted host
+# podman socket (see container.rs) to see and manage sibling crewmate
+# containers the same way an uncontainerized primary would.
 FROM debian:12-slim
 LABEL firstmate.managed=true
 
@@ -47,9 +49,9 @@ RUN curl -fsSL https://raw.githubusercontent.com/kunchenguid/no-mistakes/main/do
   && chmod o+x /root \
   && chmod -R o+rX /root/.no-mistakes
 
-# The repo is bind-mounted at its own host path (see run.sh), owned by
+# The repo is bind-mounted at its own host path (see container.rs), owned by
 # whatever uid runs podman on the host - almost never root, which is what
-# this primary runs as (--user 0:0, for podman-socket access). Without this,
+# this image runs as (--user 0:0, for podman-socket access). Without this,
 # every git operation in the primary's own checkout refuses with "detected
 # dubious ownership". Matches the same fix already in containers/dev.Containerfile
 # and containers/scout.Containerfile for crewmate images.
@@ -57,6 +59,6 @@ RUN git config --system --add safe.directory '*'
 
 RUN useradd -m -s /bin/bash agent
 USER agent
-WORKDIR /work/firstmate
+WORKDIR /work
 
 CMD ["sleep", "infinity"]

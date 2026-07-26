@@ -5,13 +5,20 @@ A `ratatui` + `crossterm` terminal frontend that wraps a firstmate primary sessi
 This is a first working slice.
 It does not yet wire into firstmate's session-backend machinery (tmux, herdr, zellij, cmux, Orca); it runs a chosen harness as a standalone child process on a pty.
 
-## Building and running
+## Installing and running
+
+Captain-facing setup is the root [`install.sh`](../install.sh) plus the installed `fm` command - see the root [`README.md`](../README.md) "Quick Start".
+Podman is the only host prerequisite; `install.sh` compiles this crate inside `tui/Containerfile`'s build container (no host Rust toolchain needed), and the installed `fm` command itself relaunches into `tui/runtime.Containerfile`'s container before running (`src/container.rs`), so the TUI's real process gets the same podman-socket privileges the firstmate primary itself needs to see sibling crewmate containers.
+
+For crate-local development instead:
 
 ```
 cargo build
 cargo test
 cargo run
 ```
+
+`cargo run` on a bare host runs the same container relaunch `fm` does; set `FM_TUI_CONTAINERIZED=1` to skip it and run the TUI natively for a quick local iteration loop (no harness credential/socket mounts are set up in that mode).
 
 On first launch, no default harness is chosen yet, so the TUI shows a picker (claude, codex, opencode, pi, grok - the verified harnesses from `AGENTS.md` section 4).
 The choice is saved to `config/tui-harness`, local and gitignored like the rest of this repo's `config/*` files (`AGENTS.md` section 2).
@@ -46,6 +53,5 @@ A line that carries the sentinel but fails to parse as valid JSON is surfaced in
 
 ## Loading screen
 
-Shown on first launch, and (via the `FM_TUI_PODMAN_BUILD` environment variable, holding the program and arguments to run) whenever a podman image needs to be pulled or built first.
-See `run.sh` and `firstmate.Containerfile` at the repo root for the container boot flow this is meant to eventually hook into.
+Shown on first launch (inside the container, once a harness is picked), and, in the outer host relaunch phase, whenever the runtime image needs building first - `FM_TUI_PODMAN_BUILD` overrides that build command (see `src/container.rs`).
 A failed build/pull crashes the process and dumps the full captured log to stdout; it is never swallowed into a short summary.

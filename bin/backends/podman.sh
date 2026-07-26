@@ -233,8 +233,10 @@ fm_backend_podman_create_task() {  # <label> <proj_abs> <kind>
   # no credentials inside a fresh crewmate container otherwise - only Claude
   # Code's own auth gets seeded below. Forwarded as a plain env var (gh reads
   # GH_TOKEN directly, no file needed) from the primary's own already-set
-  # GH_TOKEN (see run.sh's --env-file). Scout containers never get it: they
-  # run with --network=none, so gh could never reach GitHub anyway.
+  # GH_TOKEN (populated in root .env, forwarded into the primary's own
+  # container the same way by the installed `fm` command's --env-file use -
+  # see tui/src/container.rs). Scout containers never get it: they run with
+  # --network=none, so gh could never reach GitHub anyway.
   GH_TOKEN_ARGS=()
   [ -n "${GH_TOKEN:-}" ] && GH_TOKEN_ARGS=(-e "GH_TOKEN=$GH_TOKEN")
   if [ "$profile" = "$FM_BACKEND_PODMAN_SCOUT_PROFILE" ]; then

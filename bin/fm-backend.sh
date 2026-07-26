@@ -251,12 +251,12 @@ fm_backend_detect_cmux_app_is_ancestor() {
 #
 # THIS FORK's fallback default (nothing explicit, nothing auto-detected) is
 # `podman`, not tmux: this fork's primary runs containerized and as root
-# (--user 0:0, needed for podman-socket access - see run.sh), and a tmux-
-# backend crewmate inherits that root, which breaks `claude
-# --dangerously-skip-permissions` outright (it refuses to run as root). This
-# is a deliberate captain decision for this fork specifically, not a fact
-# about firstmate in general - set config/backend=tmux (or --backend tmux
-# per spawn) to opt back into tmux.
+# (--user 0:0, needed for podman-socket access - see the installed `fm`
+# command's tui/src/container.rs), and a tmux-backend crewmate inherits that
+# root, which breaks `claude --dangerously-skip-permissions` outright (it
+# refuses to run as root). This is a deliberate captain decision for this
+# fork specifically, not a fact about firstmate in general - set
+# config/backend=tmux (or --backend tmux per spawn) to opt back into tmux.
 fm_backend_name() {
   local line v detected marker
   if [ -n "${FM_BACKEND:-}" ]; then

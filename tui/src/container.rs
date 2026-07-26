@@ -33,7 +33,7 @@ pub fn relaunch_into_runtime(root: &Path) -> anyhow::Result<()> {
     let build_override = env::var("FM_TUI_PODMAN_BUILD").ok();
     if build_override.is_some() || !image_exists(RUNTIME_IMAGE) {
         let cmd = match build_override {
-            Some(s) => s.split_whitespace().map(String::from).collect(),
+            Some(s) => split_command_line(&s)?,
             None => default_build_command(root),
         };
         println!("firstmate TUI: building the runtime image (cached after first launch)...");
@@ -58,6 +58,66 @@ fn default_build_command(root: &Path) -> Vec<String> {
     ]
 }
 
+/// Splits an `FM_TUI_PODMAN_BUILD` override string into argv words,
+/// honoring single/double quotes (and backslash escapes outside single
+/// quotes) so a quoted path containing a space survives as one argument -
+/// plain `split_whitespace()` would mis-split it, the same bug the default
+/// build command was fixed against.
+fn split_command_line(s: &str) -> anyhow::Result<Vec<String>> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut in_word = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            c if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut current));
+                    in_word = false;
+                }
+            }
+            '\'' => {
+                in_word = true;
+                for c in chars.by_ref() {
+                    if c == '\'' {
+                        break;
+                    }
+                    current.push(c);
+                }
+            }
+            '"' => {
+                in_word = true;
+                loop {
+                    match chars.next() {
+                        Some('"') | None => break,
+                        Some('\\') if matches!(chars.peek(), Some('"') | Some('\\')) => {
+                            current.push(chars.next().unwrap());
+                        }
+                        Some(c) => current.push(c),
+                    }
+                }
+            }
+            '\\' => {
+                in_word = true;
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            c => {
+                in_word = true;
+                current.push(c);
+            }
+        }
+    }
+    if in_word {
+        words.push(current);
+    }
+    if words.is_empty() {
+        anyhow::bail!("FM_TUI_PODMAN_BUILD is set but empty");
+    }
+    Ok(words)
+}
+
 fn run_build_or_crash(build_cmd: &[String]) -> anyhow::Result<()> {
     let program = build_cmd
         .first()
@@ -68,6 +128,22 @@ fn run_build_or_crash(build_cmd: &[String]) -> anyhow::Result<()> {
         loading::crash_with_build_log(&outcome.log);
     }
     Ok(())
+}
+
+fn container_is_running(name: &str) -> bool {
+    Command::new("podman")
+        .args([
+            "ps",
+            "--filter",
+            &format!("name=^{name}$"),
+            "--filter",
+            "status=running",
+            "--format",
+            "{{.Names}}",
+        ])
+        .output()
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false)
 }
 
 fn image_exists(tag: &str) -> bool {
@@ -148,8 +224,17 @@ fn exec_runtime(root: &Path) -> anyhow::Result<()> {
         );
     }
 
-    // A stale container from a crashed prior run would otherwise collide on
-    // the fixed name below.
+    // The fixed container name lets a stale container from a crashed prior
+    // run collide with a fresh launch, but a *running* one means another
+    // session is active - refuse instead of silently killing it out from
+    // under that session.
+    if container_is_running(CONTAINER_NAME) {
+        anyhow::bail!(
+            "a firstmate TUI container (\"{CONTAINER_NAME}\") is already running; \
+             refusing to take over another active session. Stop it first with \
+             `podman rm -f {CONTAINER_NAME}` if it's actually stale."
+        );
+    }
     let _ = Command::new("podman")
         .args(["rm", "-f", CONTAINER_NAME])
         .output();
@@ -243,6 +328,17 @@ mod tests {
         let cmd = default_build_command(Path::new("/repo with space"));
         assert_eq!(cmd.last().unwrap(), "/repo with space");
         assert_eq!(cmd.len(), 7);
+    }
+
+    #[test]
+    fn split_command_line_keeps_a_quoted_spaced_path_as_one_argument() {
+        let cmd = split_command_line("podman build -t img -f 'Containerfile' \"/repo with space\"").unwrap();
+        assert_eq!(cmd, vec!["podman", "build", "-t", "img", "-f", "Containerfile", "/repo with space"]);
+    }
+
+    #[test]
+    fn split_command_line_rejects_empty_override() {
+        assert!(split_command_line("   ").is_err());
     }
 
     #[test]

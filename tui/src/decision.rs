@@ -57,6 +57,55 @@ pub fn parse_line(line: &str) -> Option<Result<Decision, serde_json::Error>> {
     Some(serde_json::from_str::<RawDecision>(rest.trim()).map(Decision::from))
 }
 
+/// A line accumulator over the raw pty byte stream.
+///
+/// The agent pane is a real terminal now, so the same bytes go to the
+/// emulator; this only observes them on the way past, reassembling lines
+/// across read boundaries so a sentinel split over two chunks is still
+/// found.
+pub struct Scanner {
+    line: Vec<u8>,
+}
+
+/// A line that overruns this without a newline cannot be a decision line
+/// and is almost certainly cursor-addressed screen drawing, so the partial
+/// line is dropped rather than buffered without bound.
+const MAX_LINE: usize = 64 * 1024;
+
+impl Scanner {
+    pub fn new() -> Self {
+        Scanner { line: Vec::new() }
+    }
+
+    /// Feeds one chunk of pty output and returns every decision found on a
+    /// line completed by it, in order. `Err` carries a malformed payload's
+    /// parse error so callers can surface it instead of dropping it.
+    pub fn push(&mut self, bytes: &[u8]) -> Vec<Result<Decision, String>> {
+        let mut found = Vec::new();
+        for &byte in bytes {
+            if byte == b'\n' {
+                let line = String::from_utf8_lossy(&self.line);
+                if let Some(result) = parse_line(line.trim_end_matches('\r')) {
+                    found.push(result.map_err(|err| err.to_string()));
+                }
+                self.line.clear();
+            } else {
+                if self.line.len() >= MAX_LINE {
+                    self.line.clear();
+                }
+                self.line.push(byte);
+            }
+        }
+        found
+    }
+}
+
+impl Default for Scanner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,5 +145,63 @@ mod tests {
         let line = format!("{SENTINEL} {{\"prompt\": \"p\", \"options\": []}}");
         let decision = parse_line(&line).unwrap().unwrap();
         assert_eq!(decision.options, ALWAYS_AVAILABLE.to_vec());
+    }
+
+    const DECISION_LINE: &str =
+        r#"::firstmate-decision:: {"prompt": "merge now?", "options": ["yes"]}"#;
+
+    #[test]
+    fn scanner_finds_a_decision_on_a_completed_line() {
+        let mut scanner = Scanner::new();
+        assert!(scanner.push(b"ordinary output\r\n").is_empty());
+        let found = scanner.push(format!("{DECISION_LINE}\r\n").as_bytes());
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].as_ref().unwrap().prompt, "merge now?");
+    }
+
+    /// A pty read can split anywhere, including mid-sentinel, so the
+    /// scanner has to reassemble across chunk boundaries.
+    #[test]
+    fn scanner_reassembles_a_decision_split_across_chunks() {
+        let mut scanner = Scanner::new();
+        let (head, tail) = DECISION_LINE.split_at(10);
+        assert!(scanner.push(head.as_bytes()).is_empty());
+        let found = scanner.push(format!("{tail}\n").as_bytes());
+        assert_eq!(found.len(), 1);
+        assert!(found[0].is_ok());
+    }
+
+    /// A decision is only reported once its line is terminated, so a
+    /// half-written payload never parses as a malformed one.
+    #[test]
+    fn scanner_reports_nothing_until_the_line_is_terminated() {
+        let mut scanner = Scanner::new();
+        assert!(scanner.push(DECISION_LINE.as_bytes()).is_empty());
+        assert_eq!(scanner.push(b"\n").len(), 1);
+    }
+
+    #[test]
+    fn scanner_surfaces_a_malformed_payload_as_an_error() {
+        let mut scanner = Scanner::new();
+        let found = scanner.push(format!("{SENTINEL} not json\n").as_bytes());
+        assert_eq!(found.len(), 1);
+        assert!(found[0].is_err());
+    }
+
+    /// Escape-heavy screen drawing from a full-screen harness must pass
+    /// through without being mistaken for a decision.
+    #[test]
+    fn scanner_ignores_terminal_control_sequences() {
+        let mut scanner = Scanner::new();
+        assert!(scanner.push(b"\x1b[2J\x1b[H\x1b[31mhello\x1b[0m\r\n").is_empty());
+    }
+
+    /// An unterminated line must not grow without bound on a stream that
+    /// never sends a newline.
+    #[test]
+    fn scanner_drops_an_unterminated_line_past_the_cap() {
+        let mut scanner = Scanner::new();
+        scanner.push(&vec![b'x'; MAX_LINE * 2]);
+        assert!(scanner.line.len() <= MAX_LINE);
     }
 }

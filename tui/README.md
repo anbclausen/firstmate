@@ -1,6 +1,7 @@
 # firstmate TUI
 
 A `ratatui` + `crossterm` terminal frontend that wraps a firstmate primary session, replacing the plain `claude`/`codex`/`opencode`/`pi`/`grok` terminal with a captain-facing view.
+The harness runs in an embedded terminal (`tui-term` over a `vt100` emulator), so it stays fully interactive rather than being reduced to a read-only transcript.
 
 This is a first working slice.
 It does not yet wire into firstmate's session-backend machinery (tmux, herdr, zellij, cmux, Orca); it runs a chosen harness as a standalone child process on a pty.
@@ -28,9 +29,25 @@ Delete that file to be asked again.
 
 - An animated ASCII-art head region at the top, reflecting a simple state machine: idling, thinking, talking.
   Extend it by adding a new `HeadState` arm in `src/head.rs`.
-- A transcript region below it, dimmed by default, streaming the wrapped harness's raw output.
-  The captain is not meant to watch this closely; it exists for when input is needed.
-- A decision box, rendered as a separate popup over the transcript rather than inline scrollback, whenever the wrapped harness emits a decision (see below).
+- The agent pane below it: a real embedded terminal running the wrapped harness, not a rendered transcript.
+  Harness output goes through a `vt100` emulator and is drawn by `tui-term` as a screen grid, so a full-screen harness renders normally instead of spilling escape codes.
+  The pane's size drives the pty's size, so resizing the window re-lays-out the harness.
+- A one-line status bar at the bottom, which always shows who owns the keyboard and how to quit.
+- A decision box, rendered as a popup overlay on top of the agent pane, whenever the wrapped harness emits a decision (see below).
+
+## Focus and quitting
+
+The agent pane is a real terminal, so it gets everything you type, `Ctrl+C` included - `Ctrl+C` interrupts the harness rather than the TUI.
+That leaves no ordinary key free to quit on, so the TUI reserves exactly one chord for itself, tmux-style.
+
+- `Ctrl+B` switches to command mode for the next keystroke; the status bar turns cyan to say so.
+- `Ctrl+B` then `q` quits the TUI and terminates the harness.
+  This always works, in every state.
+- `Ctrl+B` then `Ctrl+B` sends a literal `Ctrl+B` on to the harness.
+- `Ctrl+B` then any other key returns to the terminal without doing anything.
+- Once the harness has exited there is nothing left to type into, so plain `q`, `Esc`, and `Ctrl+C` quit directly.
+
+`src/keys.rs` owns the key-to-bytes translation, including the control bytes, the arrow and function-key escape sequences, and the DECCKM (application cursor keys) variants a full-screen harness switches on.
 
 ## The decision protocol
 
@@ -49,7 +66,10 @@ The wrapped process emits a single line of JSON on its own line, prefixed by a s
 The TUI always appends two more choices after the agent's own list, never supplied by the agent: `Something else` and `Chat about this`.
 Selecting either does not resolve the decision by itself; it is meant to hand control to a free-text reply channel instead of a fixed choice (that channel is not yet wired up in this slice).
 
-A line that carries the sentinel but fails to parse as valid JSON is surfaced in the transcript as a malformed-decision notice rather than silently dropped.
+`decision::Scanner` watches the same pty byte stream the emulator renders, reassembling lines across read boundaries, so the sentinel is still caught now that the pane is a terminal rather than a line feed.
+While the decision box is up it is modal: it owns the keyboard, so `Up`/`Down` and `Enter` pick a choice instead of reaching the harness, and `Esc` dismisses the box and hands the keyboard back.
+
+A line that carries the sentinel but fails to parse as valid JSON is surfaced in the status bar as a malformed-decision notice rather than silently dropped.
 
 ## Loading screen
 

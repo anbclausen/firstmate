@@ -77,6 +77,9 @@ sync_podman_clock() {
 
 ensure_podman
 ensure_podman_machine
+# Size the machine adequately before building/running any container in it
+# (raise-only; owns its own restart when a bump is needed).
+"$REPO_ROOT/bin/fm-podman-machine-size.sh"
 sync_podman_clock
 
 if [ -x "$BIN_DIR/fm" ] && [ -t 0 ] && [ -z "${FM_FORCE_REINSTALL:-}" ]; then

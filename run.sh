@@ -41,6 +41,10 @@ if [ "$(podman machine list --format '{{.Running}}' 2>/dev/null | head -1)" != "
   podman machine start
 fi
 
+# Size the machine adequately before launching the primary (raise-only; owns
+# its own restart when a bump is needed).
+"$REPO_ROOT/bin/fm-podman-machine-size.sh"
+
 # The podman-machine VM clock drifts behind real time after the host sleeps,
 # which makes apt reject future-dated repo metadata during the build (and can
 # break TLS); step it to the host's current UTC epoch. Best-effort.

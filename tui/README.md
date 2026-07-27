@@ -42,7 +42,7 @@ That leaves no ordinary key free to quit on, so the TUI reserves exactly one cho
 
 - `Ctrl+B` switches to command mode for the next keystroke; the status bar turns cyan to say so.
 - `Ctrl+B` then `q` quits the TUI and terminates the harness.
-  This always works, in every state.
+  This works whenever the harness owns the keyboard, which is every state except a decision box being up.
 - `Ctrl+B` then `Ctrl+B` sends a literal `Ctrl+B` on to the harness.
 - `Ctrl+B` then any other key returns to the terminal without doing anything.
 - Once the harness has exited there is nothing left to type into, so plain `q`, `Esc`, and `Ctrl+C` quit directly.
@@ -68,6 +68,7 @@ Selecting either does not resolve the decision by itself; it is meant to hand co
 
 `decision::Scanner` watches the same pty byte stream the emulator renders, reassembling lines across read boundaries, so the sentinel is still caught now that the pane is a terminal rather than a line feed.
 While the decision box is up it is modal: it owns the keyboard, so `Up`/`Down` and `Enter` pick a choice instead of reaching the harness, and `Esc` dismisses the box and hands the keyboard back.
+The chord is inert while the box is up, and a decision arriving mid-chord cancels it, so dismiss or answer the box first and then use `Ctrl+B` `q` to quit.
 
 A line that carries the sentinel but fails to parse as valid JSON is surfaced in the status bar as a malformed-decision notice rather than silently dropped.
 

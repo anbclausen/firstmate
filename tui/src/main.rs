@@ -153,6 +153,9 @@ impl App {
                 ChildEvent::Decision(decision) => {
                     self.head.set_state(HeadState::Thinking);
                     self.decision = Some(DecisionBox::new(decision));
+                    // The overlay owns the keyboard, so a half-entered
+                    // prefix chord must not survive into it.
+                    self.focus = Focus::Terminal;
                 }
                 ChildEvent::DecisionParseError(err) => {
                     self.notice = Some(format!("malformed decision payload: {err}"));
@@ -225,6 +228,7 @@ fn main() -> anyhow::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let result = run(&mut terminal, &mut app, &root);
+    app.kill_child();
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -526,7 +530,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: ratatui::layout::Rect) -> ra
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decision::Decision;
+    use crate::decision::{Decision, SENTINEL};
     use ratatui::backend::TestBackend;
 
     fn running_app() -> App {
@@ -607,6 +611,46 @@ mod tests {
 
         assert_eq!(handle_running_key(&mut app, key(KeyCode::Enter)), Step::Continue);
         assert!(app.decision.is_none());
+    }
+
+    /// A decision arriving mid-chord must cancel it, or the next plain key
+    /// after the box is dismissed would still be read as a command.
+    #[test]
+    fn a_decision_cancels_a_half_entered_prefix_chord() {
+        let mut app = running_app();
+        app.child = Some(
+            child::spawn(
+                "sh",
+                &[
+                    "-c".into(),
+                    format!(
+                        "printf '{SENTINEL} {{\"prompt\":\"p\",\"options\":[\"yes\"]}}\\n'; sleep 30"
+                    ),
+                ],
+                24,
+                80,
+            )
+            .unwrap(),
+        );
+
+        handle_running_key(&mut app, ctrl(PREFIX));
+        assert_eq!(app.focus, Focus::Command);
+
+        let start = Instant::now();
+        while app.decision.is_none() && start.elapsed() < Duration::from_secs(5) {
+            app.poll_child();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.decision.is_some(), "harness never produced the decision");
+        assert_eq!(app.focus, Focus::Terminal);
+
+        handle_running_key(&mut app, key(KeyCode::Esc));
+        assert!(app.decision.is_none());
+
+        assert_eq!(handle_running_key(&mut app, key(KeyCode::Char('q'))), Step::Continue);
+        assert_eq!(app.focus, Focus::Terminal);
+
+        app.kill_child();
     }
 
     /// Dismissing a decision returns to the harness rather than killing

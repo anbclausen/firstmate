@@ -152,6 +152,10 @@
       "audience": "agent-runtime"
     },
     {
+      "path": ".agents/skills/podman-containerization/SKILL.md",
+      "audience": "agent-runtime"
+    },
+    {
       "path": ".agents/skills/project-management/SKILL.md",
       "audience": "agent-runtime"
     },
@@ -256,6 +260,10 @@
       "audience": "operator-current"
     },
     {
+      "path": "docs/podman-backend.md",
+      "audience": "operator-current"
+    },
+    {
       "path": "docs/scripts.md",
       "audience": "operator-current"
     },
@@ -322,6 +330,10 @@
     {
       "path": "skills/stow/SKILL.md",
       "audience": "public-product"
+    },
+    {
+      "path": "tui/README.md",
+      "audience": "operator-current"
     }
   ]
 }

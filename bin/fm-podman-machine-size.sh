@@ -2,8 +2,12 @@
 # fm-podman-machine-size.sh - size the macOS podman machine before firstmate
 # or the TUI runs any container in it.
 #
-# Policy: target half the host's RAM and CPUs, with a floor of 8 GB and 2
+# Policy: RECOMMEND half the host's RAM and CPUs, with a floor of 8 GB and 2
 # CPUs, and only ever RAISE - never shrink a machine the captain sized larger.
+# These are defaults the user must agree to: a needed bump prompts for consent
+# when attached to a terminal, and requires FM_PODMAN_SIZE_ASSUME_YES=1 when
+# non-interactive, because applying it restarts the machine and claims host
+# resources.
 # Rationale: a podman crewmate runs its own agent, and no-mistakes spawns a
 # second nested agent per pipeline step, so an undersized machine OOM-kills
 # mid-run (see data/learnings.md 2026-07-26). Override the floor with
@@ -50,7 +54,26 @@ fi
 new_mem=$cur_mem; [ "$cur_mem" -lt "$target_mem" ] && new_mem=$target_mem
 new_cpus=$cur_cpus; [ "$cur_cpus" -lt "$target_cpus" ] && new_cpus=$target_cpus
 
-echo "fm-podman-machine-size: raising podman machine to ${new_mem} MB / ${new_cpus} CPUs (was ${cur_mem} MB / ${cur_cpus}); this restarts the machine..."
+# Consent: resizing restarts the machine and claims host RAM/CPUs, so the
+# recommended values above are only DEFAULTS the user must agree to. Prompt
+# when attached to a terminal; when non-interactive (e.g. curl | sh), require
+# explicit FM_PODMAN_SIZE_ASSUME_YES=1 rather than restarting silently.
+echo "fm-podman-machine-size: podman machine is ${cur_mem} MB / ${cur_cpus} CPUs; recommended is ${new_mem} MB / ${new_cpus} CPUs (half the host, floor ${MEM_MIN_MB} MB / ${CPUS_MIN} CPUs)."
+if [ "${FM_PODMAN_SIZE_ASSUME_YES:-}" = 1 ]; then
+  echo "fm-podman-machine-size: FM_PODMAN_SIZE_ASSUME_YES=1; applying."
+elif [ -t 0 ]; then
+  printf 'fm-podman-machine-size: apply this? it will restart the podman machine [Y/n] '
+  read -r reply
+  case "$reply" in
+    n | N | no | NO) echo "fm-podman-machine-size: leaving the machine unchanged."; exit 0 ;;
+    *) ;;
+  esac
+else
+  echo "fm-podman-machine-size: non-interactive; not resizing without consent. Re-run in a terminal, or set FM_PODMAN_SIZE_ASSUME_YES=1 (or size it yourself with 'podman machine set --memory <MB> --cpus <n>')." >&2
+  exit 0
+fi
+
+echo "fm-podman-machine-size: raising podman machine to ${new_mem} MB / ${new_cpus} CPUs; this restarts the machine..."
 was_running=false
 [ "$(podman machine list --format '{{.Running}}' 2>/dev/null | head -1)" = "true" ] && was_running=true
 

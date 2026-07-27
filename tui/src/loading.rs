@@ -1,10 +1,7 @@
-//! First-launch and podman-image-build loading screen: ASCII-art ship plus a
-//! progress bar. `container.rs` owns the actual podman build/relaunch flow
-//! this hooks into; this module only owns how the TUI presents that wait
-//! and its failure path.
-
-use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
+//! First-launch loading screen: ASCII-art ship plus a progress bar. The
+//! podman image build happens in the host-side `fm` launcher before this
+//! containerized process starts, so this module only owns how the TUI
+//! presents the brief first-run setup wait.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
@@ -59,75 +56,5 @@ impl LoadingScreen {
             .gauge_style(Style::default().fg(Color::Green))
             .percent(self.progress);
         frame.render_widget(gauge, chunks[2]);
-    }
-}
-
-/// Result of a build/pull phase run to completion.
-pub struct BuildOutcome {
-    pub success: bool,
-    pub log: Vec<String>,
-}
-
-/// Runs a build/pull command to completion, capturing its full combined
-/// output. On failure the caller must dump `log` to stdout and crash rather
-/// than swallowing it, per this TUI's loading-screen contract: a failed
-/// image build is never a silent or partial-log failure.
-pub fn run_build_command(program: &str, args: &[&str]) -> anyhow::Result<BuildOutcome> {
-    let mut child = Command::new(program)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    let mut log = Vec::new();
-    if let Some(stdout) = child.stdout.take() {
-        for line in BufReader::new(stdout).lines() {
-            log.push(line?);
-        }
-    }
-    if let Some(stderr) = child.stderr.take() {
-        for line in BufReader::new(stderr).lines() {
-            log.push(line?);
-        }
-    }
-
-    let status = child.wait()?;
-    Ok(BuildOutcome {
-        success: status.success(),
-        log,
-    })
-}
-
-/// Dumps a failed build's full log to stdout and exits the process.
-/// Called only after `run_build_command` reports failure; never swallows
-/// the log in favor of a short summary.
-pub fn crash_with_build_log(log: &[String]) -> ! {
-    println!("firstmate TUI: podman image build/pull failed. Full log:");
-    println!("----------------------------------------------------------");
-    for line in log {
-        println!("{line}");
-    }
-    println!("----------------------------------------------------------");
-    std::process::exit(1);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn successful_command_reports_success_and_captures_output() {
-        let outcome = run_build_command("sh", &["-c", "echo hello; echo world"]).unwrap();
-        assert!(outcome.success);
-        assert!(outcome.log.iter().any(|l| l == "hello"));
-        assert!(outcome.log.iter().any(|l| l == "world"));
-    }
-
-    #[test]
-    fn failing_command_reports_failure_but_still_captures_its_log() {
-        let outcome =
-            run_build_command("sh", &["-c", "echo before-failure; exit 1"]).unwrap();
-        assert!(!outcome.success);
-        assert!(outcome.log.iter().any(|l| l == "before-failure"));
     }
 }

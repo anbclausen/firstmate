@@ -1,12 +1,10 @@
 mod child;
 mod config;
-mod container;
 mod decision;
 mod decision_box;
 mod head;
 mod loading;
 
-use std::env;
 use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -118,22 +116,16 @@ impl App {
 fn main() -> anyhow::Result<()> {
     let root = repo_root();
 
-    // Bare host invocation: relaunch inside the runtime container (building
-    // it first if needed) so the TUI's real process runs with the same
-    // podman-socket privileges the firstmate primary itself needs. Only
-    // returns on failure - see container.rs.
-    if env::var_os(container::CONTAINERIZED_MARKER).is_none() {
-        return container::relaunch_into_runtime(&root);
-    }
-
+    // This binary only ever runs inside the runtime container; the host-side
+    // `fm` launcher (tui/fm) builds the image and execs `podman run` into it.
     let mut app = App::new();
     let default_harness = config::load_default_harness(&root);
     let first_run = default_harness.is_none();
     app.harness = default_harness;
 
-    // First-launch loading screen only; the podman image build/pull itself
-    // already happened in the outer host phase above (container.rs) before
-    // this containerized process ever started.
+    // First-launch loading screen only; the podman image build itself already
+    // happened in the host-side `fm` launcher before this containerized
+    // process ever started.
     if first_run {
         show_first_run_loading_screen()?;
     }

@@ -7,11 +7,12 @@
 # that file's header for the environment it provides); this script never
 # runs cargo on the host.
 #
-# The installed fm binary relaunches itself into tui/runtime.Containerfile's
-# container on every run (see tui/src/container.rs), the same podman-
-# privileged role the retired root run.sh/firstmate.Containerfile used to
-# play for the firstmate primary - this script only ever produces and places
-# the binary, it never runs the TUI itself.
+# The installed `fm` is the host-side launcher shell script (tui/fm): on every
+# run it execs `podman run` into tui/runtime.Containerfile's container, the
+# same podman-privileged role the retired root run.sh/firstmate.Containerfile
+# used to play for the firstmate primary. The compiled Rust binary is Linux-
+# only and runs only inside that container - this script produces it, places
+# the launcher, and never runs the TUI itself.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -64,8 +65,28 @@ ensure_podman_machine() {
   fi
 }
 
+# macOS podman machines run in a Linux VM whose clock drifts behind real time
+# after the host sleeps; a VM clock in the past makes apt reject repos whose
+# metadata looks future-dated (and can break TLS). Step it back to the host's
+# wall clock. No-op on Linux, where containers share the host kernel's clock.
+sync_podman_clock() {
+  [ "$(uname)" = Darwin ] || return 0
+  podman machine ssh "sudo date -s @$(date -u +%s)" >/dev/null 2>&1 \
+    || echo "install.sh: warning: could not resync podman machine clock" >&2
+}
+
 ensure_podman
 ensure_podman_machine
+sync_podman_clock
+
+if [ -x "$BIN_DIR/fm" ] && [ -t 0 ] && [ -z "${FM_FORCE_REINSTALL:-}" ]; then
+  printf 'install.sh: fm already installed at %s. Reinstall? [y/N] ' "$BIN_DIR/fm"
+  read -r reply
+  case "$reply" in
+    y | Y | yes | YES) ;;
+    *) echo "install.sh: keeping existing fm; nothing to do."; exit 0 ;;
+  esac
+fi
 
 echo "install.sh: building the tui build image..."
 podman build -t "$BUILD_IMAGE" -f "$REPO_ROOT/tui/Containerfile" "$REPO_ROOT/tui"
@@ -92,8 +113,14 @@ podman cp "$BUILD_CONTAINER:/home/agent/target/release/firstmate-tui" "$REPO_ROO
 podman rm -f "$BUILD_CONTAINER" >/dev/null 2>&1 || true
 chmod +x "$REPO_ROOT/tui/target/release/firstmate-tui"
 
+# fm is the host-side launcher (tui/fm): a native shell script that execs
+# `podman run` into the runtime container, where the Linux binary above and
+# firstmate's whole toolchain live. The compiled binary is Linux-only and
+# never runs on the host directly; installing it as `fm` on macOS would just
+# yield "exec format error". The repo path is baked in because the binary is
+# bind-mounted from this fixed location on every launch.
 mkdir -p "$BIN_DIR"
-cp "$REPO_ROOT/tui/target/release/firstmate-tui" "$BIN_DIR/fm"
+sed "s|__FM_REPO_ROOT__|$REPO_ROOT|" "$REPO_ROOT/tui/fm" > "$BIN_DIR/fm"
 chmod +x "$BIN_DIR/fm"
 
 echo "install.sh: installed fm -> $BIN_DIR/fm"

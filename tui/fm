@@ -1,0 +1,107 @@
+#!/usr/bin/env sh
+# fm - host-side launcher for the firstmate TUI.
+#
+# This runs natively on the host (it is a plain shell script, so it needs no
+# compilation and keeps podman as the only host prerequisite). Its whole job
+# is to relaunch the TUI inside the runtime container, where the actual Rust
+# binary and firstmate's whole Linux toolchain live - the same podman-
+# privileged role the retired root run.sh played for the firstmate primary.
+#
+# install.sh writes this file to the install dir with __FM_REPO_ROOT__
+# replaced by the absolute repo path, since the bind-mounted binary and repo
+# must stay at a fixed host path. Everything the compiled binary used to do on
+# the host (src/container.rs, now deleted) lives here instead.
+set -eu
+
+FM_REPO_ROOT="__FM_REPO_ROOT__"
+
+RUNTIME_IMAGE="fm-tui-runtime"
+CONTAINER_NAME="fm-tui"
+TREEHOUSE_VOLUME="fm-tui-treehouse"
+NO_MISTAKES_VOLUME="fm-tui-no-mistakes"
+BINARY="$FM_REPO_ROOT/tui/target/release/firstmate-tui"
+
+if [ ! -f "$BINARY" ]; then
+  echo "fm: compiled binary not found at $BINARY - run ./install.sh again" >&2
+  exit 1
+fi
+
+# macOS runs podman inside a Linux VM ("podman machine") that must exist and
+# be running before any podman build/run works; Linux talks to the local
+# kernel directly and needs no machine.
+if [ "$(uname)" = Darwin ]; then
+  if ! podman machine list --format '{{.Name}}' 2>/dev/null | grep -q .; then
+    echo "fm: initializing podman machine..."
+    podman machine init
+  fi
+  if [ "$(podman machine list --format '{{.Running}}' 2>/dev/null | head -1)" != "true" ]; then
+    echo "fm: starting podman machine..."
+    podman machine start
+  fi
+  # The VM clock drifts behind real time after the host sleeps, which breaks
+  # apt metadata checks and TLS; step it to the host's current UTC epoch.
+  podman machine ssh "sudo date -s @$(date -u +%s)" >/dev/null 2>&1 || true
+fi
+
+# Build the runtime image on first launch (cached after), or run an explicit
+# override build command when one is provided.
+if [ -n "${FM_TUI_PODMAN_BUILD:-}" ]; then
+  echo "fm: building the runtime image..."
+  eval "$FM_TUI_PODMAN_BUILD"
+elif ! podman image exists "$RUNTIME_IMAGE"; then
+  echo "fm: building the runtime image (cached after first launch)..."
+  podman build -t "$RUNTIME_IMAGE" \
+    -f "$FM_REPO_ROOT/tui/runtime.Containerfile" "$FM_REPO_ROOT"
+fi
+
+# A running container means another session is live - refuse rather than kill
+# it out from under that session. A stopped/stale one is safe to replace.
+if podman ps --filter "name=^${CONTAINER_NAME}$" --filter status=running \
+     --format '{{.Names}}' | grep -q .; then
+  echo "fm: a firstmate TUI container (\"$CONTAINER_NAME\") is already running;" >&2
+  echo "    refusing to take over another active session. Stop it first with" >&2
+  echo "    'podman rm -f $CONTAINER_NAME' if it is actually stale." >&2
+  exit 1
+fi
+podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+
+# Resolve the daemon's own socket path (valid inside the VM or on native
+# Linux); without this mount the container can't see sibling crewmate
+# containers, so refuse rather than degrade silently.
+SOCK="$(podman info --format '{{.Host.RemoteSocket.Path}}' 2>/dev/null || true)"
+# On macOS this comes back as a URI ("unix:///run/...sock"); the extra colons
+# would be mis-parsed as bind-mount options. Reduce to the bare path.
+SOCK="${SOCK#unix://}"
+if [ -z "$SOCK" ]; then
+  echo "fm: could not resolve the podman socket path; refusing to launch" >&2
+  echo "    without sibling-container visibility." >&2
+  exit 1
+fi
+
+set -- run -it --init --name "$CONTAINER_NAME" \
+  --user 0:0 \
+  --security-opt label=disable \
+  -v "$FM_REPO_ROOT:$FM_REPO_ROOT" \
+  -v "$TREEHOUSE_VOLUME:/home/agent/.treehouse" \
+  -v "$NO_MISTAKES_VOLUME:/home/agent/.no-mistakes" \
+  -v "$SOCK:/run/podman/podman.sock" \
+  -e FM_TUI_CONTAINERIZED=1 \
+  -e HOME=/home/agent \
+  -e CONTAINER_HOST=unix:///run/podman/podman.sock \
+  -w "$FM_REPO_ROOT"
+
+if [ -d "$HOME/.claude" ]; then
+  set -- "$@" -v "$HOME/.claude:/home/agent/.claude"
+fi
+if [ -f "$HOME/.claude.json" ]; then
+  set -- "$@" -v "$HOME/.claude.json:/home/agent/.claude.json"
+fi
+# Forwarded only if the captain already created one (e.g. holding GH_TOKEN);
+# install never asks the host for gh credentials itself.
+if [ -f "$FM_REPO_ROOT/.env" ]; then
+  set -- "$@" --env-file "$FM_REPO_ROOT/.env"
+fi
+
+set -- "$@" "$RUNTIME_IMAGE" "$BINARY"
+
+exec podman "$@"

@@ -1,9 +1,9 @@
-# tui/runtime.Containerfile - the container the installed `fm` command
-# relaunches itself into (src/container.rs), replacing the root run.sh /
+# tui/runtime.Containerfile - the container the host-side `fm` launcher
+# (tui/fm) execs `podman run` into, replacing the root run.sh /
 # firstmate.Containerfile bootstrap this supersedes. Not the build
 # environment - see tui/Containerfile for that; this image never compiles
-# anything, it only runs the already-compiled binary bind-mounted in at
-# container.rs's own host repo path.
+# anything, it only runs the already-compiled binary bind-mounted in at the
+# launcher's own host repo path.
 #
 # Tool surface matches what the wrapped harness needs to actually act as a
 # firstmate primary (gh/node/axi tools/no-mistakes/treehouse/tmux), plus

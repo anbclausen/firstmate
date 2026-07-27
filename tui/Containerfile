@@ -9,7 +9,10 @@
 FROM debian:12-slim
 LABEL firstmate.managed=true
 
-RUN apt-get update \
+# Acquire::Check-Date=false tolerates a skewed builder clock (macOS podman
+# machines drift behind real time after the host sleeps, which otherwise makes
+# apt reject a repo whose InRelease Date looks like it is in the future).
+RUN apt-get -o Acquire::Check-Date=false update \
   && apt-get install -y --no-install-recommends \
      build-essential pkg-config ca-certificates curl \
   && rm -rf /var/lib/apt/lists/*

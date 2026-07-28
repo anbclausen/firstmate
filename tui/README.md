@@ -27,22 +27,35 @@ Delete that file to be asked again.
 
 ## Layout
 
-- An animated ASCII-art head region at the top, reflecting a simple state machine: idling, thinking, talking.
+The screen is the agent pane framed by lightweight status regions; the pane is the centerpiece and is never dimmed.
+
+- Top: an animated ASCII-art head reflecting a simple state machine: idling, thinking, talking.
   Extend it by adding a new `HeadState` arm in `src/head.rs`.
-- The agent pane below it: a real embedded terminal running the wrapped harness, not a rendered transcript.
+- Left sidebar (`tasks`): a scrollable list of the backlog, read directly from `data/backlog.md` by `src/tasks.rs`.
+  It is a plain programmatic parse of the markdown `tasks-axi` writes (no agent involvement), grouped most-relevant-first: in-flight, then queued, then done, colour-coded by section, with held and blocked items marked.
+  The backlog path is resolved off the repo root the same way `src/config.rs` resolves the harness file, and the list refreshes on a timer.
+- Centre: the agent pane, a real embedded terminal running the wrapped harness, not a rendered transcript.
   Harness output goes through a `vt100` emulator and is drawn by `tui-term` as a screen grid, so a full-screen harness renders normally instead of spilling escape codes.
   The pane's size drives the pty's size, so resizing the window re-lays-out the harness.
-- A one-line status bar at the bottom, which always shows who owns the keyboard and how to quit.
+- Right sidebar (`crew`): a scrollable list of firstmate's crewmate containers and their health, read programmatically from `podman ps` by `src/crew.rs`.
+  Crewmates are the containers carrying a `firstmate.task` label (see `bin/backends/podman.sh`); health (working, stalled, stopped) is derived from the container state podman reports.
+  The `podman ps` read runs on a background thread and refreshes on a timer, so it never blocks the UI or forks podman per frame.
+- Bottom row: the current model/harness chip on the left (`src/footer.rs`) and a context-usage indicator on the right.
+  There is no honest source for the wrapped harness's context usage yet, so the indicator renders `n/a` rather than a fabricated number; `ContextUsage::Known` in `src/footer.rs` is the wiring point for a real source.
+- Just above that: a one-line status bar which always shows who owns the keyboard and how to quit.
 - A decision box, rendered as a popup overlay on top of the agent pane, whenever the wrapped harness emits a decision (see below).
+
+On a terminal too narrow to seat both sidebars and a usable pane, the sidebars collapse and the pane spans the whole middle, so a small window stays usable rather than corrupting the layout.
 
 ## Focus and quitting
 
 The agent pane is a real terminal, so it gets everything you type, `Ctrl+C` included - `Ctrl+C` interrupts the harness rather than the TUI.
 That leaves no ordinary key free to quit on, so the TUI reserves exactly one chord for itself, tmux-style.
 
-- `Ctrl+B` switches to command mode for the next keystroke; the status bar turns cyan to say so.
+- `Ctrl+B` switches to command mode; the status bar turns cyan to say so.
 - `Ctrl+B` then `q` quits the TUI and terminates the harness.
   This works whenever the harness owns the keyboard, which is every state except a decision box being up.
+- `Ctrl+B` then `Up`/`Down` scrolls the `tasks` sidebar, and `Ctrl+B` then `PageUp`/`PageDown` scrolls the `crew` sidebar; scroll keys keep command mode so a run of them walks the list.
 - `Ctrl+B` then `Ctrl+B` sends a literal `Ctrl+B` on to the harness.
 - `Ctrl+B` then any other key returns to the terminal without doing anything.
 - Once the harness has exited there is nothing left to type into, so plain `q`, `Esc`, and `Ctrl+C` quit directly.

@@ -1,10 +1,13 @@
 mod child;
 mod config;
+mod crew;
 mod decision;
 mod decision_box;
+mod footer;
 mod head;
 mod keys;
 mod loading;
+mod tasks;
 
 use std::io;
 use std::path::PathBuf;
@@ -23,8 +26,11 @@ use tui_term::widget::{Cursor, PseudoTerminal};
 
 use child::{Child, ChildEvent};
 use config::Harness;
+use crew::CrewPanel;
 use decision_box::DecisionBox;
+use footer::ContextUsage;
 use head::{Head, HeadState};
+use tasks::TasksPanel;
 
 /// Pty size used before the first draw has told us what the pane is; the
 /// real size is applied by `App::sync_size` on the very first frame.
@@ -91,6 +97,13 @@ struct App {
     notice: Option<String>,
     harness: Option<Harness>,
     pty_size: (u16, u16),
+    /// Left sidebar: the backlog, read from `data/backlog.md`.
+    tasks: TasksPanel,
+    /// Right sidebar: the crew, read from `podman ps`.
+    crew: CrewPanel,
+    /// Bottom-right context indicator. No real source is wired yet (see
+    /// `footer::ContextUsage`), so it honestly renders `n/a`.
+    context: ContextUsage,
 }
 
 impl App {
@@ -107,6 +120,9 @@ impl App {
             notice: None,
             harness: None,
             pty_size: INITIAL_SIZE,
+            tasks: TasksPanel::new(),
+            crew: CrewPanel::new(),
+            context: ContextUsage::Unavailable,
         }
     }
 
@@ -172,7 +188,7 @@ impl App {
     /// Keeps the pty and the emulator the same size as the pane on screen,
     /// so the harness lays itself out to what the captain actually sees.
     fn sync_size(&mut self, screen: Rect) {
-        let [_, pane, _] = running_layout(screen);
+        let pane = pane_rect(screen);
         let inner = Block::default().borders(Borders::ALL).inner(pane);
         let size = (inner.height, inner.width);
         if size.0 == 0 || size.1 == 0 || size == self.pty_size {
@@ -278,9 +294,33 @@ fn run(
     let mut last_tick = Instant::now();
     let mut dirty = true;
 
+    // The sidebars are backed by external state read off the UI thread: the
+    // backlog is a cheap timed file read here, while the crew's `podman ps`
+    // runs on its own thread and reports over a channel, so neither the file
+    // nor podman is ever touched per frame.
+    app.tasks.set(tasks::load(root));
+    let crew_rx = crew::spawn_monitor(Duration::from_secs(2));
+    let backlog_refresh = Duration::from_millis(1500);
+    let mut last_backlog = Instant::now();
+
     loop {
         if app.poll_child() {
             dirty = true;
+        }
+
+        while let Ok(result) = crew_rx.try_recv() {
+            let changed = match result {
+                Ok(crew) => app.crew.set(crew),
+                Err(err) => app.crew.set_error(err),
+            };
+            dirty |= changed;
+        }
+
+        if last_backlog.elapsed() >= backlog_refresh {
+            if app.tasks.set(tasks::load(root)) {
+                dirty = true;
+            }
+            last_backlog = Instant::now();
         }
 
         if matches!(app.mode, Mode::Running) {
@@ -367,6 +407,15 @@ fn handle_running_key(app: &mut App, key: KeyEvent) -> Step {
             if key.code == KeyCode::Char('q') {
                 return Step::Quit;
             }
+            // Scrolling the sidebars keeps command mode so a run of keys walks
+            // the lists; the status bar names these while command mode is up.
+            match key.code {
+                KeyCode::Up => return command_stay(app, |a| a.tasks.scroll_up()),
+                KeyCode::Down => return command_stay(app, |a| a.tasks.scroll_down()),
+                KeyCode::PageUp => return command_stay(app, |a| a.crew.scroll_up()),
+                KeyCode::PageDown => return command_stay(app, |a| a.crew.scroll_down()),
+                _ => {}
+            }
             // Ctrl+B twice is how a literal Ctrl+B gets through to the
             // harness; anything else just leaves command mode.
             if is_prefix(key) {
@@ -392,17 +441,76 @@ fn handle_running_key(app: &mut App, key: KeyEvent) -> Step {
     }
 }
 
-/// Head, agent pane, status bar. Shared by drawing and by the resize path
-/// so the pty is always sized to the pane that is actually rendered.
-fn running_layout(area: Rect) -> [Rect; 3] {
-    Layout::default()
+/// Run a command-mode sidebar action and stay in command mode, so a run of
+/// scroll keys walks a list without re-entering the prefix chord each time.
+fn command_stay(app: &mut App, action: impl FnOnce(&mut App)) -> Step {
+    action(app);
+    app.focus = Focus::Command;
+    Step::Continue
+}
+
+const HEAD_HEIGHT: u16 = 8;
+const SIDEBAR_WIDTH: u16 = 24;
+const MIN_PANE_WIDTH: u16 = 30;
+
+/// The full running layout: the face on top, then a middle row of
+/// tasks sidebar | agent pane | crew sidebar, then the status line and the
+/// model/context footer. The agent pane stays the centerpiece; on a terminal
+/// too narrow to seat both sidebars and a usable pane, the sidebars collapse
+/// and the pane spans the whole middle rather than corrupting the layout.
+struct Areas {
+    head: Rect,
+    tasks: Option<Rect>,
+    pane: Rect,
+    crew: Option<Rect>,
+    status: Rect,
+    footer: Rect,
+}
+
+fn compute_layout(area: Rect) -> Areas {
+    let [head, middle, status, footer] = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(8),
+            Constraint::Length(HEAD_HEIGHT),
             Constraint::Min(3),
             Constraint::Length(1),
+            Constraint::Length(1),
         ])
-        .areas(area)
+        .areas(area);
+
+    if area.width >= 2 * SIDEBAR_WIDTH + MIN_PANE_WIDTH {
+        let [tasks, pane, crew] = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(SIDEBAR_WIDTH),
+                Constraint::Min(MIN_PANE_WIDTH),
+                Constraint::Length(SIDEBAR_WIDTH),
+            ])
+            .areas(middle);
+        Areas {
+            head,
+            tasks: Some(tasks),
+            pane,
+            crew: Some(crew),
+            status,
+            footer,
+        }
+    } else {
+        Areas {
+            head,
+            tasks: None,
+            pane: middle,
+            crew: None,
+            status,
+            footer,
+        }
+    }
+}
+
+/// The agent pane rect. Shared by drawing and by the resize path so the pty is
+/// always sized to the pane that is actually rendered.
+fn pane_rect(area: Rect) -> Rect {
+    compute_layout(area).pane
 }
 
 fn draw(frame: &mut ratatui::Frame, app: &App) {
@@ -438,9 +546,16 @@ fn draw_choose_harness(frame: &mut ratatui::Frame, selected: usize) {
 }
 
 fn draw_running(frame: &mut ratatui::Frame, app: &App) {
-    let [head_area, pane_area, status_area] = running_layout(frame.area());
+    let areas = compute_layout(frame.area());
 
-    app.head.render(frame, head_area);
+    app.head.render(frame, areas.head);
+
+    if let Some(tasks_area) = areas.tasks {
+        app.tasks.render(frame, tasks_area);
+    }
+    if let Some(crew_area) = areas.crew {
+        app.crew.render(frame, crew_area);
+    }
 
     let screen = app.parser.screen();
     let title = match app.harness {
@@ -454,12 +569,19 @@ fn draw_running(frame: &mut ratatui::Frame, app: &App) {
     let pane = PseudoTerminal::new(screen)
         .block(Block::default().borders(Borders::ALL).title(title))
         .cursor(Cursor::default().visibility(cursor_visible));
-    frame.render_widget(pane, pane_area);
+    frame.render_widget(pane, areas.pane);
 
-    frame.render_widget(status_bar(app), status_area);
+    frame.render_widget(status_bar(app), areas.status);
+
+    let [model_area, context_area] = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .areas(areas.footer);
+    footer::render_model(frame, model_area, app.harness);
+    footer::render_context(frame, context_area, app.context);
 
     if let Some(decision) = &app.decision {
-        let popup = centered_rect(60, 40, pane_area);
+        let popup = centered_rect(60, 40, areas.pane);
         frame.render_widget(Clear, popup);
         decision.render(frame, popup);
     }
@@ -491,7 +613,7 @@ fn status_bar(app: &App) -> Paragraph<'static> {
     } else {
         match app.focus {
             Focus::Command => (
-                " command - q quits, ctrl+b sends ctrl+b, any other key returns ".to_string(),
+                " command - q quits, up/down scroll tasks, pgup/pgdn scroll crew, ctrl+b sends ctrl+b, any other key returns ".to_string(),
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
@@ -672,7 +794,7 @@ mod tests {
     #[test]
     fn sync_size_matches_the_emulator_to_the_pane_inside_its_border() {
         let mut app = running_app();
-        let [_, pane, _] = running_layout(Rect::new(0, 0, 100, 40));
+        let pane = pane_rect(Rect::new(0, 0, 100, 40));
 
         app.sync_size(Rect::new(0, 0, 100, 40));
 
@@ -716,7 +838,7 @@ mod tests {
             "escape bytes leaked into the rendered screen"
         );
 
-        let [_, pane, _] = running_layout(screen);
+        let pane = pane_rect(screen);
         let inner = Block::default().borders(Borders::ALL).inner(pane);
         let cell = &buffer[(inner.x + 4, inner.y + 2)];
         assert_eq!(cell.symbol(), "a", "cursor addressing was not honoured");
@@ -782,5 +904,87 @@ mod tests {
             app.decision.as_ref().map(|d| d.decision.prompt.as_str()),
             Some("p")
         );
+    }
+
+    fn render_to_string(app: &App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw_running(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    /// Every region the captain expects has to be on screen at once: the face,
+    /// both sidebars with their live data, the model chip, and the context
+    /// indicator, all around the agent pane.
+    #[test]
+    fn the_full_layout_shows_every_region() {
+        let mut app = running_app();
+        app.harness = Some(Harness::Claude);
+        app.tasks
+            .set(tasks::parse_backlog("## In flight\n- [ ] tui-layout - build it (since 2026-07-27)\n"));
+        app.crew.set(
+            crew::parse_ps(
+                r#"[{"Names":["fm-h-tui-layout"],"State":"running","Status":"Up 2 minutes","Labels":{"firstmate.task":"tui-layout"}}]"#,
+            )
+            .expect("sample podman ps json parses"),
+        );
+
+        let rendered = render_to_string(&app, 100, 40);
+
+        assert!(rendered.contains("tasks"), "tasks sidebar title missing");
+        assert!(rendered.contains("crew"), "crew sidebar title missing");
+        assert!(rendered.contains("tui-layout"), "task id missing");
+        assert!(rendered.contains("model: claude"), "model chip missing");
+        assert!(rendered.contains("context"), "context indicator missing");
+        assert!(rendered.contains("n/a"), "context should read n/a with no source");
+    }
+
+    /// A terminal too narrow for two sidebars and a usable pane must collapse
+    /// the sidebars and keep the pane, not panic or corrupt the layout.
+    #[test]
+    fn a_narrow_terminal_collapses_the_sidebars() {
+        let wide = compute_layout(Rect::new(0, 0, 100, 40));
+        assert!(wide.tasks.is_some() && wide.crew.is_some());
+
+        let narrow = compute_layout(Rect::new(0, 0, 50, 20));
+        assert!(narrow.tasks.is_none() && narrow.crew.is_none());
+        // The pane keeps the whole middle width when the sidebars are gone.
+        assert_eq!(narrow.pane.width, 50);
+
+        // Rendering at a squeeze must not panic.
+        let mut app = running_app();
+        app.harness = Some(Harness::Claude);
+        let _ = render_to_string(&app, 50, 20);
+        let _ = render_to_string(&app, 8, 6);
+    }
+
+    /// Command mode scrolls the sidebars in place and only leaves for a key
+    /// that is not a scroll key.
+    #[test]
+    fn command_mode_scrolls_the_sidebars_and_stays() {
+        let mut app = running_app();
+        app.child = Some(child::spawn("cat", &[], 24, 80).unwrap());
+        app.tasks.set(tasks::parse_backlog(
+            "## Queued\n- [ ] a - one (since 2026-07-27)\n- [ ] b - two (since 2026-07-27)\n",
+        ));
+
+        handle_running_key(&mut app, ctrl(PREFIX));
+        assert_eq!(app.focus, Focus::Command);
+        assert_eq!(
+            handle_running_key(&mut app, key(KeyCode::Down)),
+            Step::Continue
+        );
+        assert_eq!(app.focus, Focus::Command, "a scroll key keeps command mode");
+
+        // A non-scroll key returns to the terminal.
+        handle_running_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.focus, Focus::Terminal);
+
+        app.kill_child();
     }
 }

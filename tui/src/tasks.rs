@@ -209,9 +209,10 @@ fn clean_title(rest: &str) -> (String, bool, bool) {
 const DEP_MARKERS: [&str; 3] = ["blocked-by:", "parent:", "discovered-from:"];
 
 /// Byte offset where the trailing dependency region starts, if the tail of `s`
-/// is one: a run of `<marker> <id>` pairs reaching the end of the line. Prose
-/// that merely contains a marker word (`Fix parent: field handling`) is not a
-/// dependency region, so it stays in the title and never flags the task blocked.
+/// is one: a run of `<marker> <id>` pairs reaching the end of the line, the last
+/// of which may carry the canonical ` - <reason>` tail. Prose that merely
+/// contains a marker word (`Fix parent: field handling`) is not a dependency
+/// region, so it stays in the title and never flags the task blocked.
 fn dep_region_start(s: &str) -> Option<usize> {
     let tokens = tokens_with_offsets(s);
     (0..tokens.len())
@@ -256,6 +257,10 @@ fn is_dep_region(tokens: &[(usize, &str)]) -> bool {
             }
         } else if !valid_id(inline) {
             return false;
+        }
+        // `<marker> <id> - <reason>`: the reason runs to end of line.
+        if matches!(tokens.get(i), Some((_, "-"))) {
+            return true;
         }
     }
     true
@@ -544,6 +549,14 @@ mod tests {
         let tasks = parse_backlog(src);
         assert_eq!(tasks[0].title, "Fix parent: field handling in tasks-axi");
         assert!(!tasks[0].blocked);
+    }
+
+    #[test]
+    fn a_dependency_with_a_reason_strips_and_flags_blocked() {
+        let src = "## Queued\n- [ ] legal-release - Release approval blocked-by: external-legal - external legal dependency (repo: sample) (kind: ship)\n";
+        let tasks = parse_backlog(src);
+        assert_eq!(tasks[0].title, "Release approval");
+        assert!(tasks[0].blocked);
     }
 
     #[test]

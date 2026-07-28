@@ -126,22 +126,28 @@ pub fn parse_backlog(src: &str) -> Vec<Task> {
     tasks
 }
 
-/// In-flight items are written as the same `- [ ] <id>` checkbox as queued ones
-/// (the section header carries the state), but older tasks-axi output used
-/// `- **<id>**`, so both are recognized for the in-flight section.
+/// The section header carries the state, not the checkbox mark, so `- [ ]` and
+/// `- [x]` are both accepted everywhere (matching `bin/fm-backlog-handoff.sh`'s
+/// `^- \[[ x]\] +`). Older tasks-axi output used `- **<id>**` for in-flight
+/// items, so that form is recognized there too.
 fn match_bullet(line: &str, state: TaskState) -> Option<(&str, &str)> {
     match state {
-        TaskState::Done => parse_checkbox(line, 'x'),
-        TaskState::Queued => parse_checkbox(line, ' '),
-        TaskState::InFlight => parse_star(line).or_else(|| parse_checkbox(line, ' ')),
+        TaskState::InFlight => parse_star(line).or_else(|| parse_checkbox(line)),
+        _ => parse_checkbox(line),
     }
 }
 
-fn parse_checkbox(line: &str, mark: char) -> Option<(&str, &str)> {
+fn parse_checkbox(line: &str) -> Option<(&str, &str)> {
     let rest = line.strip_prefix("- [")?;
-    let rest = rest.strip_prefix(mark)?;
-    let rest = rest.strip_prefix("] ")?;
-    split_id_rest(rest)
+    let rest = rest
+        .strip_prefix(' ')
+        .or_else(|| rest.strip_prefix('x'))?
+        .strip_prefix(']')?;
+    let trimmed = rest.trim_start_matches(' ');
+    if trimmed.len() == rest.len() {
+        return None;
+    }
+    split_id_rest(trimmed)
 }
 
 fn parse_star(line: &str) -> Option<(&str, &str)> {
@@ -259,7 +265,7 @@ fn is_tag_content(content: &str) -> bool {
         "hold-until:",
         "repo:",
     ];
-    if KEYS.iter().any(|k| lower.starts_with(k)) || lower.contains("repo:") {
+    if KEYS.iter().any(|k| lower.starts_with(k)) {
         return true;
     }
     // `(since <date>)` and the `(merged|reported|done|closed <date>)` closures.
@@ -473,6 +479,32 @@ mod tests {
         assert_eq!(tasks[0].id, "old-style");
         assert_eq!(tasks[0].state, TaskState::InFlight);
         assert_eq!(tasks[0].title, "a legacy in-flight bullet");
+    }
+
+    #[test]
+    fn the_checkbox_mark_and_spacing_do_not_gate_the_section() {
+        let src = "\
+## In flight
+- [x] marked-in-flight - still in flight (since 2026-07-27)
+## Queued
+- [ ]  double-space - extra spacing (since 2026-07-27)
+## Done
+- [ ] unmarked-done - left unmarked (done 2026-07-27)
+";
+        let tasks = parse_backlog(src);
+        let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["marked-in-flight", "double-space", "unmarked-done"]);
+        assert_eq!(tasks[0].state, TaskState::InFlight);
+        assert_eq!(tasks[1].state, TaskState::Queued);
+        assert_eq!(tasks[1].title, "extra spacing");
+        assert_eq!(tasks[2].state, TaskState::Done);
+    }
+
+    #[test]
+    fn a_prose_parenthetical_mentioning_repo_survives() {
+        let src = "## Queued\n- [ ] doc-fix - fix the docs (see repo: notes)\n";
+        let tasks = parse_backlog(src);
+        assert_eq!(tasks[0].title, "fix the docs (see repo: notes)");
     }
 
     #[test]

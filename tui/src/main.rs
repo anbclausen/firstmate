@@ -613,7 +613,7 @@ fn status_bar(app: &App) -> Paragraph<'static> {
     } else {
         match app.focus {
             Focus::Command => (
-                " command - up/down scroll tasks, pgup/pgdn scroll crew, q quits, ctrl+b sends ctrl+b, any other key returns ".to_string(),
+                " command - q quits, up/down scroll tasks, pgup/pgdn scroll crew, ctrl+b sends ctrl+b, any other key returns ".to_string(),
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)

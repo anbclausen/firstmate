@@ -78,10 +78,22 @@ pub fn render_model(frame: &mut Frame, area: Rect, harness: Option<Harness>) {
     frame.render_widget(chip, area);
 }
 
+/// The right-aligned indicator text, sized to the room available. The reading
+/// itself is what matters, so a footer too narrow for a legible bar drops the
+/// bar rather than letting the right-aligned paragraph clip the percentage.
+pub fn context_text(usage: ContextUsage, width: usize) -> String {
+    let label = usage.label();
+    let fixed = "context ".len() + label.len() + 2;
+    let cells = width.saturating_sub(fixed + 2);
+    if cells < 4 {
+        format!("context {label} ")
+    } else {
+        format!("context {} {label} ", usage.bar(cells.min(20)))
+    }
+}
+
 pub fn render_context(frame: &mut Frame, area: Rect, usage: ContextUsage) {
-    // Size the bar to the room available, within sane bounds.
-    let cells = usize::from(area.width).saturating_sub(14).clamp(4, 20);
-    let text = format!("context {} {} ", usage.bar(cells), usage.label());
+    let text = context_text(usage, usize::from(area.width));
     let widget = Paragraph::new(Line::from(Span::styled(
         text,
         Style::default().fg(usage.color()),
@@ -112,6 +124,23 @@ mod tests {
     fn context_percentage_is_clamped() {
         assert_eq!(ContextUsage::Known(200).label(), "100%");
         assert_eq!(ContextUsage::Known(200).bar(4), "[####]");
+    }
+
+    #[test]
+    fn a_narrow_footer_drops_the_bar_and_keeps_the_reading() {
+        assert_eq!(context_text(ContextUsage::Unavailable, 18), "context n/a ");
+        assert_eq!(context_text(ContextUsage::Known(50), 8), "context 50% ");
+    }
+
+    #[test]
+    fn a_wide_footer_fits_bar_label_and_padding() {
+        let text = context_text(ContextUsage::Unavailable, 40);
+        assert_eq!(text, "context [--------------------] n/a ");
+        assert!(text.len() <= 40);
+
+        let text = context_text(ContextUsage::Unavailable, 24);
+        assert_eq!(text, "context [---------] n/a ");
+        assert!(text.len() <= 24);
     }
 
     #[test]

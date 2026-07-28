@@ -927,9 +927,12 @@ mod tests {
         app.harness = Some(Harness::Claude);
         app.tasks
             .set(tasks::parse_backlog("## In flight\n- [ ] tui-layout - build it (since 2026-07-27)\n"));
-        app.crew.set(crew::parse_ps(
-            "fm-h-tui-layout\trunning\tUp 2 minutes\tfirstmate.task=tui-layout\n",
-        ));
+        app.crew.set(
+            crew::parse_ps(
+                r#"[{"Names":["fm-h-tui-layout"],"State":"running","Status":"Up 2 minutes","Labels":{"firstmate.task":"tui-layout"}}]"#,
+            )
+            .expect("sample podman ps json parses"),
+        );
 
         let rendered = render_to_string(&app, 100, 40);
 

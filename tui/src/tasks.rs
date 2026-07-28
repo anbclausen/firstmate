@@ -187,7 +187,7 @@ fn valid_id(id: &str) -> bool {
 /// tasks-axi's own grammar owns.
 fn clean_title(rest: &str) -> (String, bool, bool) {
     let held = rest.contains("(hold:");
-    let blocked = first_dep_marker(rest).is_some();
+    let mut blocked = false;
 
     let mut s: String = rest.trim().to_string();
     loop {
@@ -198,6 +198,7 @@ fn clean_title(rest: &str) -> (String, bool, bool) {
         }
         if let Some(stripped) = strip_trailing_dep(trimmed) {
             s = stripped;
+            blocked = true;
             continue;
         }
         break;
@@ -207,31 +208,61 @@ fn clean_title(rest: &str) -> (String, bool, bool) {
 
 const DEP_MARKERS: [&str; 3] = ["blocked-by:", "parent:", "discovered-from:"];
 
-/// Byte offsets where a dependency marker begins at a word boundary.
-fn dep_marker_positions(s: &str) -> Vec<usize> {
-    let bytes = s.as_bytes();
-    let mut positions = Vec::new();
-    for marker in DEP_MARKERS {
-        let mut from = 0;
-        while let Some(rel) = s[from..].find(marker) {
-            let at = from + rel;
-            let boundary = at == 0 || bytes[at - 1].is_ascii_whitespace();
-            if boundary {
-                positions.push(at);
-            }
-            from = at + marker.len();
-        }
-    }
-    positions.sort_unstable();
-    positions
+/// Byte offset where the trailing dependency region starts, if the tail of `s`
+/// is one: a run of `<marker> <id>` pairs reaching the end of the line. Prose
+/// that merely contains a marker word (`Fix parent: field handling`) is not a
+/// dependency region, so it stays in the title and never flags the task blocked.
+fn dep_region_start(s: &str) -> Option<usize> {
+    let tokens = tokens_with_offsets(s);
+    (0..tokens.len())
+        .find(|&i| is_dep_region(&tokens[i..]))
+        .map(|i| tokens[i].0)
 }
 
-fn first_dep_marker(s: &str) -> Option<usize> {
-    dep_marker_positions(s).first().copied()
+fn tokens_with_offsets(s: &str) -> Vec<(usize, &str)> {
+    let mut tokens = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, c) in s.char_indices() {
+        if c.is_whitespace() {
+            if let Some(b) = start.take() {
+                tokens.push((b, &s[b..i]));
+            }
+        } else if start.is_none() {
+            start = Some(i);
+        }
+    }
+    if let Some(b) = start {
+        tokens.push((b, &s[b..]));
+    }
+    tokens
+}
+
+fn is_dep_region(tokens: &[(usize, &str)]) -> bool {
+    if tokens.is_empty() {
+        return false;
+    }
+    let mut i = 0;
+    while i < tokens.len() {
+        let token = tokens[i].1;
+        let Some(marker) = DEP_MARKERS.iter().find(|m| token.starts_with(**m)) else {
+            return false;
+        };
+        let inline = &token[marker.len()..];
+        i += 1;
+        if inline.is_empty() {
+            match tokens.get(i) {
+                Some((_, id)) if valid_id(id) => i += 1,
+                _ => return false,
+            }
+        } else if !valid_id(inline) {
+            return false;
+        }
+    }
+    true
 }
 
 fn strip_trailing_dep(s: &str) -> Option<String> {
-    let at = *dep_marker_positions(s).last()?;
+    let at = dep_region_start(s)?;
     Some(s[..at].trim_end().to_string())
 }
 
@@ -505,6 +536,22 @@ mod tests {
         let src = "## Queued\n- [ ] doc-fix - fix the docs (see repo: notes)\n";
         let tasks = parse_backlog(src);
         assert_eq!(tasks[0].title, "fix the docs (see repo: notes)");
+    }
+
+    #[test]
+    fn prose_mentioning_a_dependency_word_survives() {
+        let src = "## Queued\n- [ ] fix-parent - Fix parent: field handling in tasks-axi (since 2026-07-27)\n";
+        let tasks = parse_backlog(src);
+        assert_eq!(tasks[0].title, "Fix parent: field handling in tasks-axi");
+        assert!(!tasks[0].blocked);
+    }
+
+    #[test]
+    fn several_trailing_dependency_markers_strip_together() {
+        let src = "## Queued\n- [ ] child - do the thing parent: tui-layout blocked-by: crew-health\n";
+        let tasks = parse_backlog(src);
+        assert_eq!(tasks[0].title, "do the thing");
+        assert!(tasks[0].blocked);
     }
 
     #[test]

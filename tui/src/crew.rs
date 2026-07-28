@@ -8,12 +8,15 @@
 //! `firstmate.managed=true` but no task label, so filtering on the task label
 //! selects exactly the crew. The `podman ps` call runs on a background thread
 //! and reports over a channel, so the poll never blocks the UI or forks podman
-//! per frame. The line parser is pure so it is testable without a live podman.
+//! per frame. The output parser is pure so it is testable without a live podman.
 
+use std::collections::HashMap;
 use std::process::Command;
 use std::sync::mpsc::{channel, Receiver};
 use std::thread;
 use std::time::Duration;
+
+use serde::Deserialize;
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -96,48 +99,52 @@ fn classify_from_status(status: &str) -> Health {
     }
 }
 
-/// The Go-template `podman ps --format` this backend reads: name, state, human
-/// status, then the whole label map (parsed here rather than via a per-version
-/// `{{.Label ...}}` function, so the same output is readable across podman
-/// builds).
-pub const PS_FORMAT: &str = "{{.Names}}\t{{.State}}\t{{.Status}}\t{{.Labels}}";
-
-/// Parse the tab-delimited `podman ps` output produced by `PS_FORMAT`.
-pub fn parse_ps(output: &str) -> Vec<Crewmate> {
-    let mut crew = Vec::new();
-    for raw in output.lines() {
-        let line = raw.strip_suffix('\r').unwrap_or(raw);
-        if line.trim().is_empty() {
-            continue;
-        }
-        let mut fields = line.splitn(4, '\t');
-        let name = fields.next().unwrap_or("").trim();
-        let state = fields.next().unwrap_or("").trim();
-        let status = fields.next().unwrap_or("").trim();
-        let labels = fields.next().unwrap_or("");
-
-        let task = label_value(labels, "firstmate.task")
-            .filter(|t| !t.is_empty())
-            .unwrap_or_else(|| name.to_string());
-        crew.push(Crewmate {
-            task,
-            health: classify(state, status),
-            status: status.to_string(),
-        });
-    }
-    crew
+/// One container as `podman ps --format json` reports it. The JSON form is read
+/// rather than a Go template because podman renders `{{.Labels}}` as a Go map
+/// literal, not as docker's comma-joined `key=value` list, while the JSON
+/// `Labels` object is stable across podman builds.
+#[derive(Debug, Deserialize)]
+struct PsEntry {
+    #[serde(rename = "Names", default)]
+    names: Option<Vec<String>>,
+    #[serde(rename = "State", default)]
+    state: Option<String>,
+    #[serde(rename = "Status", default)]
+    status: Option<String>,
+    #[serde(rename = "Labels", default)]
+    labels: Option<HashMap<String, String>>,
 }
 
-/// Extract a single label's value from podman's comma-joined `key=value` label
-/// rendering, matching the key exactly so `firstmate.task` never picks up a
-/// longer key that merely starts with it.
-fn label_value(labels: &str, key: &str) -> Option<String> {
-    labels.split(',').find_map(|part| {
-        part.trim()
-            .strip_prefix(key)
-            .and_then(|rest| rest.strip_prefix('='))
-            .map(|value| value.to_string())
-    })
+/// Parse `podman ps --format json` output. A read podman could not produce
+/// well-formed JSON for is an error the sidebar reports rather than an empty
+/// roster it would show as if the crew were gone.
+pub fn parse_ps(json: &str) -> Result<Vec<Crewmate>, String> {
+    if json.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let entries: Vec<PsEntry> =
+        serde_json::from_str(json).map_err(|err| format!("podman ps unreadable: {err}"))?;
+
+    Ok(entries
+        .into_iter()
+        .map(|entry| {
+            let state = entry.state.unwrap_or_default();
+            let status = entry.status.unwrap_or_default();
+            let task = entry
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("firstmate.task"))
+                .map(|task| task.trim().to_string())
+                .filter(|task| !task.is_empty())
+                .or_else(|| entry.names.as_ref().and_then(|names| names.first().cloned()))
+                .unwrap_or_default();
+            Crewmate {
+                health: classify(state.trim(), status.trim()),
+                task,
+                status: status.trim().to_string(),
+            }
+        })
+        .collect())
 }
 
 /// One `podman ps` read. Errors (podman missing, machine down) come back as a
@@ -150,7 +157,7 @@ pub fn fetch() -> Result<Vec<Crewmate>, String> {
             "--filter",
             "label=firstmate.task",
             "--format",
-            PS_FORMAT,
+            "json",
         ])
         .output()
         .map_err(|err| format!("podman unavailable: {err}"))?;
@@ -159,7 +166,7 @@ pub fn fetch() -> Result<Vec<Crewmate>, String> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("podman ps failed: {}", stderr.trim()));
     }
-    Ok(parse_ps(&String::from_utf8_lossy(&output.stdout)))
+    parse_ps(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// Spawn a background poller that reads `podman ps` every `interval` and reports
@@ -316,38 +323,62 @@ mod tests {
         assert_eq!(classify("", ""), Health::Unknown);
     }
 
+    const PS_JSON: &str = r#"[
+  {
+    "Names": ["fm-ab12-tui-layout"],
+    "State": "running",
+    "Status": "Up 5 minutes",
+    "Labels": {
+      "firstmate.managed": "true",
+      "firstmate.home": "ab12",
+      "firstmate.task-note": "nope",
+      "firstmate.task": "tui-layout"
+    }
+  },
+  {
+    "Names": ["fm-ab12-crew-health"],
+    "State": "exited",
+    "Status": "Exited (0) 1 minute ago",
+    "Labels": {"firstmate.managed": "true", "firstmate.task": "crew-health"}
+  }
+]"#;
+
     #[test]
-    fn parses_ps_rows_into_crew() {
-        let output = "\
-fm-ab12-tui-layout\trunning\tUp 5 minutes\tfirstmate.managed=true,firstmate.home=ab12,firstmate.task=tui-layout
-fm-ab12-crew-health\texited\tExited (0) 1 minute ago\tfirstmate.managed=true,firstmate.task=crew-health
-";
-        let crew = parse_ps(output);
+    fn parses_ps_json_into_crew() {
+        let crew = parse_ps(PS_JSON).unwrap();
         assert_eq!(crew.len(), 2);
         assert_eq!(crew[0].task, "tui-layout");
         assert_eq!(crew[0].health, Health::Working);
+        assert_eq!(crew[0].status, "Up 5 minutes");
         assert_eq!(crew[1].task, "crew-health");
         assert_eq!(crew[1].health, Health::Stopped);
     }
 
     #[test]
-    fn matches_the_task_label_exactly() {
-        // A longer key that merely starts with the sought key must not match.
-        let labels = "firstmate.task-note=nope,firstmate.task=real";
-        assert_eq!(label_value(labels, "firstmate.task").as_deref(), Some("real"));
-    }
-
-    #[test]
     fn falls_back_to_the_container_name_without_a_task_label() {
-        let output = "fm-ab12-mystery\trunning\tUp 1 minute\tfirstmate.managed=true\n";
-        let crew = parse_ps(output);
+        let json = r#"[{"Names":["fm-ab12-mystery"],"State":"running","Status":"Up 1 minute","Labels":{"firstmate.managed":"true"}}]"#;
+        let crew = parse_ps(json).unwrap();
         assert_eq!(crew[0].task, "fm-ab12-mystery");
     }
 
     #[test]
+    fn tolerates_a_null_label_map_and_missing_fields() {
+        let json = r#"[{"Names":["fm-ab12-bare"],"Labels":null}]"#;
+        let crew = parse_ps(json).unwrap();
+        assert_eq!(crew[0].task, "fm-ab12-bare");
+        assert_eq!(crew[0].health, Health::Unknown);
+    }
+
+    #[test]
     fn empty_output_is_no_crew() {
-        assert!(parse_ps("").is_empty());
-        assert!(parse_ps("\n  \n").is_empty());
+        assert!(parse_ps("").unwrap().is_empty());
+        assert!(parse_ps("  \n").unwrap().is_empty());
+        assert!(parse_ps("[]").unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_json_is_an_error_not_an_empty_roster() {
+        assert!(parse_ps("not json").is_err());
     }
 
     #[test]

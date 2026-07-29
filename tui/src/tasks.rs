@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +49,14 @@ impl TaskState {
         }
     }
 
+    fn label(self) -> &'static str {
+        match self {
+            TaskState::InFlight => "in flight",
+            TaskState::Queued => "queued",
+            TaskState::Done => "done",
+        }
+    }
+
     /// The section header state, matching `tasks-axi`'s markdown backend: a
     /// column-0 `## In flight` / `## Queued` / `## Done...` heading.
     fn from_header(text: &str) -> Option<TaskState> {
@@ -72,6 +80,10 @@ pub struct Task {
     pub state: TaskState,
     pub held: bool,
     pub blocked: bool,
+    /// The item's full prose: the bullet head exactly as written, tags and all,
+    /// followed by its indented body lines. The sidebar shows the cleaned-up
+    /// title; the detail overlay shows this.
+    pub detail: String,
 }
 
 /// The backlog path, resolved off the repo root the same robust way
@@ -90,11 +102,11 @@ pub fn load(repo_root: &Path) -> Vec<Task> {
         .unwrap_or_default()
 }
 
-/// Parse the backlog markdown into a flat, relevance-ordered task list. Body
-/// continuation lines (2-space indented) and any preamble are ignored; only the
-/// bullet head of each item in a recognized section becomes a `Task`.
+/// Parse the backlog markdown into a flat, relevance-ordered task list. Any
+/// preamble is ignored; a bullet head in a recognized section becomes a `Task`,
+/// and the indented body lines that follow it become that task's detail.
 pub fn parse_backlog(src: &str) -> Vec<Task> {
-    let mut tasks = Vec::new();
+    let mut tasks: Vec<Task> = Vec::new();
     let mut section: Option<TaskState> = None;
 
     for raw in src.lines() {
@@ -116,7 +128,14 @@ pub fn parse_backlog(src: &str) -> Vec<Task> {
                 state,
                 held,
                 blocked,
+                detail: rest.trim().to_string(),
             });
+        } else if line.starts_with("  ") && !line.trim().is_empty() {
+            // A body continuation line belongs to the bullet above it.
+            if let Some(task) = tasks.last_mut() {
+                task.detail.push('\n');
+                task.detail.push_str(line.trim());
+            }
         }
     }
 
@@ -366,6 +385,11 @@ impl TasksPanel {
         }
     }
 
+    /// The task the cursor is on, which is what the detail overlay shows.
+    pub fn selected(&self) -> Option<&Task> {
+        self.state.selected().and_then(|i| self.tasks.get(i))
+    }
+
     pub fn scroll_down(&mut self) {
         if self.tasks.is_empty() {
             return;
@@ -411,6 +435,42 @@ impl Default for TasksPanel {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The detail overlay: the selected task's full description, popped over the
+/// TUI while the captain walks the backlog. The sidebar can only show a
+/// truncated title, so this is where the whole item is legible.
+pub fn render_detail(frame: &mut Frame, area: Rect, task: &Task) {
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            task.id.clone(),
+            Style::default()
+                .fg(task.state.color())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  [{}]", task.state.label()),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])];
+    lines.push(Line::from(""));
+    lines.extend(
+        task.detail
+            .lines()
+            .map(|line| Line::from(Span::styled(line.to_string(), Style::default().fg(Color::Gray)))),
+    );
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("task")
+        .style(Style::default().fg(Color::Cyan));
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn task_item(task: &Task) -> ListItem<'static> {
@@ -505,6 +565,23 @@ mod tests {
         let tasks = parse_backlog(SAMPLE);
         assert!(tasks.iter().all(|t| t.id != "Intent"));
         assert_eq!(tasks.len(), 6);
+    }
+
+    /// The sidebar shows a cleaned-up title, so the whole item - tags and body
+    /// alike - has to survive somewhere for the detail overlay to show.
+    #[test]
+    fn keeps_the_whole_item_as_the_detail() {
+        let tasks = parse_backlog(SAMPLE);
+        let task = tasks.iter().find(|t| t.id == "tui-layout").unwrap();
+        assert_eq!(
+            task.detail,
+            "Build the full firstmate-tui layout (since 2026-07-27)\nIntent line one\nsecond line"
+        );
+        // A body belongs to its own bullet, not the next one.
+        assert_eq!(
+            tasks.iter().find(|t| t.id == "sm-thing").unwrap().detail,
+            "secondmate charter (kind: secondmate) (since 2026-07-27)"
+        );
     }
 
     #[test]

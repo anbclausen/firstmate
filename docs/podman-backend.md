@@ -55,10 +55,13 @@ container from, in this order:
 2. **Standard profile**: otherwise, one of two tracked profiles under
    `containers/` at the firstmate repo root, selected by the task's kind
    (`fm_backend_podman_profile_for`):
-   - `containers/dev.Containerfile` (tag `fm-podman-dev:latest`) - the
-     general coding profile, for ship tasks.
    - `containers/scout.Containerfile` (tag `fm-podman-scout:latest`) - the
      restricted investigation profile, for scout tasks.
+   - `containers/dev.Containerfile` (tag `fm-podman-dev:latest`) - the
+     general coding profile. It is NOT a fallback for a ship task: a
+     dev-profile task against a project with no repo-root `Containerfile`
+     is refused, because that generic image lacks the project's toolchain
+     and its tests could not run. Add a `Containerfile` to that project.
 
 Both images are Debian-slim with `tmux`, `git`, and `ca-certificates`
 installed, running as a non-root `agent` user. Neither bakes in a specific

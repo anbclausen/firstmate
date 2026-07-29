@@ -190,4 +190,44 @@ case "$calls" in
 esac
 pass "dangling-image GC scopes its podman image prune call to label=firstmate.managed=true"
 
+# --- image selection: per-project Containerfile required for dev-profile work -
+
+proj="$DIR/proj-with-cf"
+mkdir -p "$proj"
+printf 'FROM scratch\n' > "$proj/Containerfile"
+: > "$FM_PODMAN_LOG"
+img=$(fm_backend_podman_image_for "$proj" ship 2>/dev/null) \
+  || fail "image_for should build the per-project image when the project has a Containerfile"
+case "$img" in
+  fm-podman-proj-*) : ;;
+  *) fail "image_for should return a per-project tag, got: $img" ;;
+esac
+case "$(log_calls)" in
+  *"build"*"$proj/Containerfile"*) : ;;
+  *) fail "image_for should build from the project's own Containerfile; got: $(log_calls)" ;;
+esac
+pass "image_for builds the per-project image from a repo-root Containerfile"
+
+proj="$DIR/proj-without-cf"
+mkdir -p "$proj"
+: > "$FM_PODMAN_LOG"
+if err=$(fm_backend_podman_image_for "$proj" ship 2>&1 >/dev/null); then
+  fail "image_for must refuse a ship task with no project Containerfile"
+fi
+case "$err" in
+  *"no Containerfile"*Containerfile*) : ;;
+  *) fail "image_for's refusal must name the missing Containerfile; got: $err" ;;
+esac
+case "$(log_calls)" in
+  *build*) fail "image_for must not build the generic dev image for a ship task" ;;
+esac
+pass "image_for refuses a ship task without a project Containerfile and builds nothing"
+
+: > "$FM_PODMAN_LOG"
+img=$(fm_backend_podman_image_for "$proj" scout 2>/dev/null) \
+  || fail "image_for should still serve the standard scout profile without a project Containerfile"
+[ "$img" = "$(fm_backend_podman_standard_image_tag scout)" ] \
+  || fail "image_for scout should return the standard scout tag, got: $img"
+pass "image_for still uses the standard scout profile when a project has no Containerfile"
+
 echo "all fm-backend-podman.test.sh checks passed"

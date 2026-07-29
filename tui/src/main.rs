@@ -372,7 +372,7 @@ fn run(
             }
         }
 
-        if app.head.settle(HEAD_QUIET) {
+        if app.head.settle(HEAD_QUIET, app.decision.is_some()) {
             dirty = true;
         }
 

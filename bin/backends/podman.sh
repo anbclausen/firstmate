@@ -153,7 +153,8 @@ fm_backend_podman_path_hash() {  # <path>
 # root wins over the standard library (devcontainer-style override); its
 # built image is tagged per-project so a Containerfile edit is picked up by
 # `podman build`'s own layer-cache invalidation on the next spawn, never
-# reused stale.
+# reused stale. Without one, only a scout task falls back to the standard
+# library; a dev-profile task refuses rather than run a toolchain-less image.
 # Both branches build a SHARED, CACHED image tag reused by every future task
 # for the same project (project branch) or the same profile (standard-library
 # branch), never a disposable per-task tag - so ordinary task teardown never
@@ -169,6 +170,14 @@ fm_backend_podman_image_for() {  # <proj_abs> <kind> -> prints image tag
     return 0
   fi
   profile=$(fm_backend_podman_profile_for "$kind")
+  # A dev-profile task actually builds and tests the project, so the generic
+  # standard image is never an acceptable substitute for the project's own
+  # toolchain: refuse instead of silently running without it. Scout stays on
+  # the standard read-mostly profile, which is the whole point of that profile.
+  if [ "$profile" = "$FM_BACKEND_PODMAN_DEV_PROFILE" ]; then
+    echo "error: project has no Containerfile at $cf - a '$kind' task needs a per-project dev image carrying the project's own toolchain; add a repo-root Containerfile to that project (the standard '$profile' profile is not a substitute)" >&2
+    return 1
+  fi
   tag=$(fm_backend_podman_standard_image_tag "$profile")
   cprofile="$FM_BACKEND_PODMAN_CONTAINERS_DIR/$profile.Containerfile"
   [ -f "$cprofile" ] || { echo "error: no Containerfile at $cf and no standard profile at $cprofile" >&2; return 1; }

@@ -44,8 +44,13 @@ explain the reasoning to the captain when it is not obvious:
    base image), so the standard profiles are skipped entirely. This is a
    devcontainer-style override, not a merge: the project's Containerfile is
    the whole image definition.
-2. **Otherwise, pick the best-fit standard profile from `containers/`** by
-   the task's classified deliverable (AGENTS.md section 7):
+2. **Otherwise, only a scout task may use a standard profile from
+   `containers/`.** A ship task against a project with no repo-root
+   `Containerfile` is refused at spawn: the generic dev image carries no
+   project toolchain, so the project's own build and tests could not run.
+   Report that the project needs its own `Containerfile` rather than
+   retrying on another profile. By the task's classified deliverable
+   (AGENTS.md section 7):
    - **scout** (investigation, diagnosis, planning, reproduction, audit -
      never expected to write code) -> `containers/scout.Containerfile`.
      Runs with a read-only root filesystem, the project mounted read-only,
@@ -53,10 +58,10 @@ explain the reasoning to the captain when it is not obvious:
      directory writable. A scout task genuinely does not need to modify the
      project or reach the network to investigate and report, so those
      capabilities are withheld rather than granted-then-trusted-not-to-use.
-   - **ship** (the default; implementation work) -> `containers/dev.Containerfile`.
-     Runs with the project mounted read-write and normal network access
-     (registries, `gh`, `git fetch`/`push`), since a coding task genuinely
-     needs both.
+   - **ship** (the default; implementation work) -> the project's own
+     `Containerfile`, which is required. Runs with the project mounted
+     read-write and normal network access (registries, `gh`, `git
+     fetch`/`push`), since a coding task genuinely needs both.
 
 Explain the least-privilege rationale in plain terms when it matters to the
 captain: the container never gets `--privileged`, never gets added Linux

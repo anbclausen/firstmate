@@ -110,7 +110,7 @@ cmux has no session layer at all - one workspace per task, in whatever cmux wind
 The caller-facing label remains `fm-<id>`, but the actual cmux workspace title is scoped by the active `FM_HOME` readable label plus a short hash of the resolved `FM_ROOT` path as `fm-<home-label>-<id>`.
 Test cleanup must use the guarded path in [`docs/cmux-backend.md`](cmux-backend.md#current-operation-and-safety), never enumerate-and-close every workspace.
 podman has one container per task, named `fm-<home-label>-<id>` via the same shared home-tag helper cmux/zellij use, so distinct firstmate homes sharing one podman machine cannot collide; there is no session layer or socket password to configure.
-[`docs/podman-backend.md`](podman-backend.md) "Container profiles" owns image selection (a project's own root `Containerfile`, else the tracked `containers/dev.Containerfile` or `containers/scout.Containerfile` standard profile) and the least-privilege run-flag contract (no `--privileged`, minimal added capabilities, only the task worktree mounted, read-only plus a scratch tmpfs for scout tasks).
+[`docs/podman-backend.md`](podman-backend.md) "Container profiles" owns image selection (a project's own root `Containerfile`, required for ship work and falling back to the tracked `containers/scout.Containerfile` standard profile only for scout tasks) and the least-privilege run-flag contract (no `--privileged`, minimal added capabilities, only the task worktree mounted, read-only plus a scratch tmpfs for scout tasks).
 The `config/backend` file is not inherited by secondmate homes.
 
 ## Away-mode supervisor backend (FM_SUPERVISOR_BACKEND / FM_SUPERVISOR_TARGET)

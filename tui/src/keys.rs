@@ -44,6 +44,11 @@ pub fn encode(key: KeyEvent, modes: Modes) -> Option<Vec<u8>> {
                 c.to_string().into_bytes()
             }
         }
+        // Shift+Enter is the harnesses' "newline, don't submit" chord, so it
+        // has to send a bare line feed; a carriage return is what submits.
+        // This only reaches us at all because `main.rs` asks the terminal for
+        // the keyboard enhancements that tell the two apart.
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => vec![b'\n'],
         KeyCode::Enter => vec![b'\r'],
         KeyCode::Tab => vec![b'\t'],
         KeyCode::BackTab => b"\x1b[Z".to_vec(),
@@ -191,6 +196,16 @@ mod tests {
     #[test]
     fn enter_sends_carriage_return_not_line_feed() {
         assert_eq!(encoded(key(KeyCode::Enter)), vec![0x0d]);
+    }
+
+    /// Shift+Enter must open a new line in the harness's input, not submit it,
+    /// which is what a carriage return does.
+    #[test]
+    fn shift_enter_sends_a_newline_rather_than_submitting() {
+        assert_eq!(
+            encoded(chord(KeyCode::Enter, KeyModifiers::SHIFT)),
+            vec![0x0a]
+        );
     }
 
     #[test]

@@ -3,7 +3,6 @@ mod config;
 mod crew;
 mod decision;
 mod decision_box;
-mod footer;
 mod head;
 mod keys;
 mod loading;
@@ -13,9 +12,15 @@ use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
+    LeaveAlternateScreen,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -28,7 +33,6 @@ use child::{Child, ChildEvent};
 use config::Harness;
 use crew::CrewPanel;
 use decision_box::DecisionBox;
-use footer::ContextUsage;
 use head::{Head, HeadState};
 use tasks::TasksPanel;
 
@@ -38,6 +42,10 @@ const INITIAL_SIZE: (u16, u16) = (24, 80);
 
 /// How much scrollback the emulator keeps behind the visible screen.
 const SCROLLBACK: usize = 1000;
+
+/// How long the session has to stay quiet before the figurehead stops
+/// claiming the harness is still talking or thinking.
+const HEAD_QUIET: Duration = Duration::from_millis(600);
 
 fn repo_root() -> PathBuf {
     // This binary lives at <repo>/tui; walk up from the crate manifest dir
@@ -101,9 +109,10 @@ struct App {
     tasks: TasksPanel,
     /// Right sidebar: the crew, read from `podman ps`.
     crew: CrewPanel,
-    /// Bottom-right context indicator. No real source is wired yet (see
-    /// `footer::ContextUsage`), so it honestly renders `n/a`.
-    context: ContextUsage,
+    /// Whether the selected task's full description is popped over the TUI.
+    /// Raised by walking the backlog in command mode, dropped as soon as the
+    /// captain navigates away from it.
+    task_detail: bool,
 }
 
 impl App {
@@ -122,7 +131,7 @@ impl App {
             pty_size: INITIAL_SIZE,
             tasks: TasksPanel::new(),
             crew: CrewPanel::new(),
-            context: ContextUsage::Unavailable,
+            task_detail: false,
         }
     }
 
@@ -170,15 +179,17 @@ impl App {
                     self.head.set_state(HeadState::Thinking);
                     self.decision = Some(DecisionBox::new(decision));
                     // The overlay owns the keyboard, so a half-entered
-                    // prefix chord must not survive into it.
+                    // prefix chord and a task detail popped over the TUI must
+                    // not survive into it.
                     self.focus = Focus::Terminal;
+                    self.task_detail = false;
                 }
                 ChildEvent::DecisionParseError(err) => {
                     self.notice = Some(format!("malformed decision payload: {err}"));
                 }
                 ChildEvent::Exited(code) => {
                     self.exited = Some(code);
-                    self.head.set_state(HeadState::Idle);
+                    self.head.set_state(HeadState::Gone);
                 }
             }
         }
@@ -240,12 +251,26 @@ fn main() -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
+    // Without the disambiguating keyboard protocol a terminal reports
+    // Shift+Enter as a plain Enter, so the harness can never be told to open a
+    // new line instead of submitting. Terminals that do not support it are left
+    // alone rather than sent a sequence they would print.
+    let enhanced = supports_keyboard_enhancement().unwrap_or(false);
+    if enhanced {
+        execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let result = run(&mut terminal, &mut app, &root);
     app.kill_child();
 
+    if enhanced {
+        execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags)?;
+    }
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
@@ -347,6 +372,10 @@ fn run(
             }
         }
 
+        if app.head.settle(HEAD_QUIET) {
+            dirty = true;
+        }
+
         if last_tick.elapsed() >= tick_rate {
             app.head.advance();
             last_tick = Instant::now();
@@ -409,11 +438,33 @@ fn handle_running_key(app: &mut App, key: KeyEvent) -> Step {
             }
             // Scrolling the sidebars keeps command mode so a run of keys walks
             // the lists; the status bar names these while command mode is up.
+            // Walking the backlog pops the selected task's full description
+            // over the TUI, since the sidebar can only show a clipped title.
             match key.code {
-                KeyCode::Up => return command_stay(app, |a| a.tasks.scroll_up()),
-                KeyCode::Down => return command_stay(app, |a| a.tasks.scroll_down()),
-                KeyCode::PageUp => return command_stay(app, |a| a.crew.scroll_up()),
-                KeyCode::PageDown => return command_stay(app, |a| a.crew.scroll_down()),
+                KeyCode::Up => {
+                    return command_stay(app, |a| {
+                        a.tasks.scroll_up();
+                        a.task_detail = true;
+                    })
+                }
+                KeyCode::Down => {
+                    return command_stay(app, |a| {
+                        a.tasks.scroll_down();
+                        a.task_detail = true;
+                    })
+                }
+                KeyCode::PageUp => {
+                    return command_stay(app, |a| {
+                        a.crew.scroll_up();
+                        a.task_detail = false;
+                    })
+                }
+                KeyCode::PageDown => {
+                    return command_stay(app, |a| {
+                        a.crew.scroll_down();
+                        a.task_detail = false;
+                    })
+                }
                 _ => {}
             }
             // Ctrl+B twice is how a literal Ctrl+B gets through to the
@@ -422,6 +473,7 @@ fn handle_running_key(app: &mut App, key: KeyEvent) -> Step {
                 app.send_key(key);
             }
             app.focus = Focus::Terminal;
+            app.task_detail = false;
             Step::Continue
         }
         Focus::Terminal => {
@@ -449,60 +501,61 @@ fn command_stay(app: &mut App, action: impl FnOnce(&mut App)) -> Step {
     Step::Continue
 }
 
-const HEAD_HEIGHT: u16 = 8;
+/// The figurehead's eight art lines plus its label, inside its border.
+const HEAD_HEIGHT: u16 = 11;
 const SIDEBAR_WIDTH: u16 = 24;
+/// Wide enough to seat the figurehead unclipped inside its border.
+const RIGHT_WIDTH: u16 = head::FIGUREHEAD_WIDTH + 2;
 const MIN_PANE_WIDTH: u16 = 30;
 
-/// The full running layout: the face on top, then a middle row of
-/// tasks sidebar | agent pane | crew sidebar, then the status line and the
-/// model/context footer. The agent pane stays the centerpiece; on a terminal
-/// too narrow to seat both sidebars and a usable pane, the sidebars collapse
-/// and the pane spans the whole middle rather than corrupting the layout.
+/// The full running layout: one full-height row of tasks sidebar | agent pane |
+/// right column, with the figurehead above the crew in that right column, and a
+/// single status line under the lot. The agent pane stays the centerpiece; on a
+/// terminal too narrow to seat both columns and a usable pane, they collapse
+/// and the pane spans the whole width rather than corrupting the layout.
 struct Areas {
-    head: Rect,
+    head: Option<Rect>,
     tasks: Option<Rect>,
     pane: Rect,
     crew: Option<Rect>,
     status: Rect,
-    footer: Rect,
 }
 
 fn compute_layout(area: Rect) -> Areas {
-    let [head, middle, status, footer] = Layout::default()
+    let [main, status] = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(HEAD_HEIGHT),
-            Constraint::Min(3),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Min(3), Constraint::Length(1)])
         .areas(area);
 
-    if area.width >= 2 * SIDEBAR_WIDTH + MIN_PANE_WIDTH {
-        let [tasks, pane, crew] = Layout::default()
+    if area.width >= SIDEBAR_WIDTH + MIN_PANE_WIDTH + RIGHT_WIDTH {
+        let [tasks, pane, right] = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
                 Constraint::Length(SIDEBAR_WIDTH),
                 Constraint::Min(MIN_PANE_WIDTH),
-                Constraint::Length(SIDEBAR_WIDTH),
+                Constraint::Length(RIGHT_WIDTH),
             ])
-            .areas(middle);
+            .areas(main);
+        // `Max` on the figurehead so a short terminal shrinks it rather than
+        // squeezing the crew list out of the column entirely.
+        let [head, crew] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Max(HEAD_HEIGHT), Constraint::Min(3)])
+            .areas(right);
         Areas {
-            head,
+            head: Some(head),
             tasks: Some(tasks),
             pane,
             crew: Some(crew),
             status,
-            footer,
         }
     } else {
         Areas {
-            head,
+            head: None,
             tasks: None,
-            pane: middle,
+            pane: main,
             crew: None,
             status,
-            footer,
         }
     }
 }
@@ -548,8 +601,9 @@ fn draw_choose_harness(frame: &mut ratatui::Frame, selected: usize) {
 fn draw_running(frame: &mut ratatui::Frame, app: &App) {
     let areas = compute_layout(frame.area());
 
-    app.head.render(frame, areas.head);
-
+    if let Some(head_area) = areas.head {
+        app.head.render(frame, head_area);
+    }
     if let Some(tasks_area) = areas.tasks {
         app.tasks.render(frame, tasks_area);
     }
@@ -573,12 +627,13 @@ fn draw_running(frame: &mut ratatui::Frame, app: &App) {
 
     frame.render_widget(status_bar(app), areas.status);
 
-    let [model_area, context_area] = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .areas(areas.footer);
-    footer::render_model(frame, model_area, app.harness);
-    footer::render_context(frame, context_area, app.context);
+    // The detail overlay is up only while the captain is walking the backlog,
+    // and a decision box outranks it.
+    if app.task_detail && app.decision.is_none() {
+        if let Some(task) = app.tasks.selected() {
+            tasks::render_detail(frame, centered_rect(70, 60, frame.area()), task);
+        }
+    }
 
     if let Some(decision) = &app.decision {
         let popup = centered_rect(60, 40, areas.pane);
@@ -918,9 +973,9 @@ mod tests {
             .collect()
     }
 
-    /// Every region the captain expects has to be on screen at once: the face,
-    /// both sidebars with their live data, the model chip, and the context
-    /// indicator, all around the agent pane.
+    /// Every region the captain expects has to be on screen at once: the
+    /// figurehead and the crew stacked in the top-right column, the tasks
+    /// sidebar, and their live data, all around the agent pane.
     #[test]
     fn the_full_layout_shows_every_region() {
         let mut app = running_app();
@@ -938,21 +993,116 @@ mod tests {
 
         assert!(rendered.contains("tasks"), "tasks sidebar title missing");
         assert!(rendered.contains("crew"), "crew sidebar title missing");
+        assert!(rendered.contains("firstmate"), "figurehead title missing");
         assert!(rendered.contains("tui-layout"), "task id missing");
-        assert!(rendered.contains("model: claude"), "model chip missing");
-        assert!(rendered.contains("context"), "context indicator missing");
-        assert!(rendered.contains("n/a"), "context should read n/a with no source");
     }
 
-    /// A terminal too narrow for two sidebars and a usable pane must collapse
-    /// the sidebars and keep the pane, not panic or corrupt the layout.
+    /// The context and model readouts are already inside the agent pane, so
+    /// the bottom bar must not repeat them.
+    #[test]
+    fn the_bottom_bar_no_longer_repeats_the_model_or_context() {
+        let mut app = running_app();
+        app.harness = Some(Harness::Claude);
+        let rendered = render_to_string(&app, 100, 40);
+        assert!(!rendered.contains("model:"), "model chip should be gone");
+        assert!(!rendered.contains("context"), "context readout should be gone");
+    }
+
+    /// The spec's shape: tasks and the agent pane run the full height of the
+    /// main area from its very top, with the figurehead above the crew in the
+    /// top-right column and only the status line below them.
+    #[test]
+    fn the_panes_fill_the_main_area_with_the_head_above_the_crew() {
+        let screen = Rect::new(0, 0, 100, 40);
+        let areas = compute_layout(screen);
+        let tasks = areas.tasks.expect("tasks pane");
+        let head = areas.head.expect("figurehead");
+        let crew = areas.crew.expect("crew pane");
+
+        assert_eq!((tasks.y, areas.pane.y, head.y), (0, 0, 0), "all start at the top");
+        assert_eq!(tasks.height, areas.pane.height, "tasks fills the pane's height");
+        assert_eq!(tasks.bottom(), areas.status.y, "only the status line is below");
+
+        assert_eq!(head.x, crew.x, "the head and the crew share the right column");
+        assert_eq!(head.bottom(), crew.y, "the crew sits directly under the head");
+        assert_eq!(crew.bottom(), areas.status.y);
+        assert!(
+            head.width >= head::FIGUREHEAD_WIDTH + 2,
+            "the figurehead must fit inside its border"
+        );
+        assert_eq!(areas.status.height, 1);
+    }
+
+    /// A short terminal must keep a usable crew list rather than letting the
+    /// figurehead take the whole column.
+    #[test]
+    fn a_short_terminal_shrinks_the_head_before_the_crew() {
+        let areas = compute_layout(Rect::new(0, 0, 100, 12));
+        let head = areas.head.expect("figurehead");
+        let crew = areas.crew.expect("crew pane");
+        assert!(crew.height >= 3, "the crew keeps a usable minimum");
+        assert!(head.height < HEAD_HEIGHT, "the head gives way first");
+        assert_eq!(head.bottom(), crew.y);
+    }
+
+    /// The figurehead has to show the live session state, not a fixed pose.
+    #[test]
+    fn the_figurehead_follows_the_live_session_state() {
+        let mut app = running_app();
+        assert!(render_to_string(&app, 100, 40).contains("idling"));
+
+        app.head.set_state(HeadState::Talking);
+        assert!(render_to_string(&app, 100, 40).contains("talking"));
+
+        app.exited = Some(0);
+        app.head.set_state(HeadState::Gone);
+        assert!(render_to_string(&app, 100, 40).contains("off watch"));
+    }
+
+    /// Walking the backlog pops the whole item over the TUI, because the
+    /// sidebar can only ever show a clipped title.
+    #[test]
+    fn walking_the_backlog_pops_the_task_detail_and_dismisses_it_on_the_way_out() {
+        let mut app = running_app();
+        app.child = Some(child::spawn("cat", &[], 24, 80).unwrap());
+        app.tasks.set(tasks::parse_backlog(
+            "## In flight\n- [ ] tui-layout - build it (since 2026-07-27)\n  the whole story of the task\n",
+        ));
+
+        handle_running_key(&mut app, ctrl(PREFIX));
+        assert!(!app.task_detail, "the chord alone must not pop the overlay");
+
+        handle_running_key(&mut app, key(KeyCode::Down));
+        assert!(app.task_detail);
+        let rendered = render_to_string(&app, 100, 40);
+        assert!(
+            rendered.contains("the whole story of the task"),
+            "expected the full description, got {rendered:?}"
+        );
+
+        // Navigating to the crew list, and leaving command mode entirely, both
+        // take the overlay back down.
+        handle_running_key(&mut app, key(KeyCode::PageDown));
+        assert!(!app.task_detail);
+
+        handle_running_key(&mut app, key(KeyCode::Up));
+        assert!(app.task_detail);
+        handle_running_key(&mut app, key(KeyCode::Esc));
+        assert!(!app.task_detail);
+        assert!(!render_to_string(&app, 100, 40).contains("the whole story"));
+
+        app.kill_child();
+    }
+
+    /// A terminal too narrow for both columns and a usable pane must collapse
+    /// them and keep the pane, not panic or corrupt the layout.
     #[test]
     fn a_narrow_terminal_collapses_the_sidebars() {
         let wide = compute_layout(Rect::new(0, 0, 100, 40));
         assert!(wide.tasks.is_some() && wide.crew.is_some());
 
         let narrow = compute_layout(Rect::new(0, 0, 50, 20));
-        assert!(narrow.tasks.is_none() && narrow.crew.is_none());
+        assert!(narrow.tasks.is_none() && narrow.crew.is_none() && narrow.head.is_none());
         // The pane keeps the whole middle width when the sidebars are gone.
         assert_eq!(narrow.pane.width, 50);
 

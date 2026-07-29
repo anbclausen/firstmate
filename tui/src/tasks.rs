@@ -108,6 +108,9 @@ pub fn load(repo_root: &Path) -> Vec<Task> {
 pub fn parse_backlog(src: &str) -> Vec<Task> {
     let mut tasks: Vec<Task> = Vec::new();
     let mut section: Option<TaskState> = None;
+    // The bullet a body line may attach to, cleared at every section header so
+    // an indented line can never land on a task from the section above it.
+    let mut open: Option<usize> = None;
 
     for raw in src.lines() {
         let line = raw.strip_suffix('\r').unwrap_or(raw);
@@ -116,12 +119,14 @@ pub fn parse_backlog(src: &str) -> Vec<Task> {
         // `  ## ...` body heading never does, matching the tasks-axi grammar).
         if line.starts_with("##") && line[2..].starts_with(char::is_whitespace) {
             section = TaskState::from_header(&line[2..]);
+            open = None;
             continue;
         }
 
         let Some(state) = section else { continue };
         if let Some((id, rest)) = match_bullet(line, state) {
             let (title, held, blocked) = clean_title(rest);
+            open = Some(tasks.len());
             tasks.push(Task {
                 id: id.to_string(),
                 title,
@@ -132,7 +137,7 @@ pub fn parse_backlog(src: &str) -> Vec<Task> {
             });
         } else if line.starts_with("  ") && !line.trim().is_empty() {
             // A body continuation line belongs to the bullet above it.
-            if let Some(task) = tasks.last_mut() {
+            if let Some(task) = open.and_then(|i| tasks.get_mut(i)) {
                 task.detail.push('\n');
                 task.detail.push_str(line.trim());
             }
@@ -437,10 +442,49 @@ impl Default for TasksPanel {
     }
 }
 
+/// Whether the overlay's content is taller than the room inside its borders.
+/// Pure, so the cue is testable without a terminal.
+fn detail_overflows(header: &str, detail: &str, area: Rect) -> bool {
+    let (Some(width), Some(height)) = (area.width.checked_sub(2), area.height.checked_sub(2)) else {
+        return true;
+    };
+    let rows = std::iter::once(header)
+        .chain(std::iter::once(""))
+        .chain(detail.lines())
+        .map(|line| wrapped_rows(line, width))
+        .sum::<usize>();
+    rows > usize::from(height)
+}
+
+/// Rows one line takes once word-wrapped to `width`, mirroring the `Wrap`
+/// the paragraph is rendered with.
+fn wrapped_rows(line: &str, width: u16) -> usize {
+    let width = usize::from(width).max(1);
+    let mut rows = 1;
+    let mut used = 0;
+    for word in line.split(' ') {
+        let len = word.chars().count().max(1);
+        if used == 0 {
+            used = len;
+        } else if used + 1 + len <= width {
+            used += 1 + len;
+        } else {
+            rows += 1;
+            used = len;
+        }
+        while used > width {
+            rows += 1;
+            used -= width;
+        }
+    }
+    rows
+}
+
 /// The detail overlay: the selected task's full description, popped over the
 /// TUI while the captain walks the backlog. The sidebar can only show a
 /// truncated title, so this is where the whole item is legible.
 pub fn render_detail(frame: &mut Frame, area: Rect, task: &Task) {
+    let header = format!("{}  [{}]", task.id, task.state.label());
     let mut lines = vec![Line::from(vec![
         Span::styled(
             task.id.clone(),
@@ -460,9 +504,16 @@ pub fn render_detail(frame: &mut Frame, area: Rect, task: &Task) {
             .map(|line| Line::from(Span::styled(line.to_string(), Style::default().fg(Color::Gray)))),
     );
 
+    // The overlay is a fixed size, so a long item is simply cut off; say so
+    // rather than letting the captain read a silently truncated description.
+    let title = if detail_overflows(&header, &task.detail, area) {
+        "task - truncated"
+    } else {
+        "task"
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("task")
+        .title(title)
         .style(Style::default().fg(Color::Cyan));
     frame.render_widget(Clear, area);
     frame.render_widget(
@@ -582,6 +633,44 @@ mod tests {
             tasks.iter().find(|t| t.id == "sm-thing").unwrap().detail,
             "secondmate charter (kind: secondmate) (since 2026-07-27)"
         );
+    }
+
+    /// A body line can only ever belong to a bullet from its own section, so
+    /// stray indented text under a new heading must not land on the last task.
+    #[test]
+    fn a_body_line_never_crosses_a_section_header() {
+        let src = "## In flight\n- [ ] a - x\n## Queued\n  stray indented note\n- [ ] b - y\n";
+        let tasks = parse_backlog(src);
+        assert_eq!(tasks.iter().find(|t| t.id == "a").unwrap().detail, "x");
+        assert_eq!(tasks.iter().find(|t| t.id == "b").unwrap().detail, "y");
+    }
+
+    fn detail_task(detail: &str) -> Task {
+        Task {
+            id: "t".to_string(),
+            title: "t".to_string(),
+            state: TaskState::Queued,
+            held: false,
+            blocked: false,
+            detail: detail.to_string(),
+        }
+    }
+
+    /// The overlay is a fixed size, so the captain needs to be told when the
+    /// description it shows is not all of it.
+    #[test]
+    fn the_overlay_flags_only_content_that_does_not_fit() {
+        let area = Rect::new(0, 0, 20, 6);
+        let short = detail_task("one\ntwo");
+        let header = format!("{}  [{}]", short.id, short.state.label());
+        assert!(!detail_overflows(&header, &short.detail, area));
+
+        let long = detail_task(&"line\n".repeat(20));
+        assert!(detail_overflows(&header, &long.detail, area));
+
+        // Wrapping counts too: one long line can outgrow the box on its own.
+        let wrapped = detail_task(&"word ".repeat(40));
+        assert!(detail_overflows(&header, &wrapped.detail, area));
     }
 
     #[test]

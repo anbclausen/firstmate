@@ -39,6 +39,7 @@ The screen is the agent pane framed by lightweight status regions; the pane is t
   The pane's size drives the pty's size, so resizing the window re-lays-out the harness.
 - Top right: the figurehead, an animated ASCII first mate at the helm showing the live session state - idling, thinking, talking, or off watch once the harness has exited.
   The state is driven by what the session actually does, and settles back to idling after a quiet spell rather than freezing on the last thing the harness did.
+  A pending decision box holds the state instead, since the session really is blocked on it until the captain answers.
   The drawing is one frame with animated eye, mouth, and helm slots; extend it by adding a `HeadState` arm in `src/head.rs`.
 - Under the figurehead (`crew`): a scrollable list of firstmate's crewmate containers and their health, read programmatically from `podman ps` by `src/crew.rs`.
   Crewmates are the containers carrying a `firstmate.task` label (see `bin/backends/podman.sh`); health (working, stalled, stopped) is derived from the container state podman reports.
@@ -62,6 +63,7 @@ That leaves no ordinary key free to quit on, so the TUI reserves exactly one cho
 - `Ctrl+B` then `Up`/`Down` walks the `tasks` pane, and `Ctrl+B` then `PageUp`/`PageDown` scrolls the `crew` list; scroll keys keep command mode so a run of them walks the list.
   Walking the tasks pane pops the selected task's full description - the whole bullet plus its body lines - over the TUI, since the sidebar can only show a clipped title.
   It comes back down as soon as the captain scrolls the crew list, leaves command mode, or a decision box arrives.
+  The overlay is a fixed size, so an item too long to fit is titled `task - truncated` rather than being cut off silently.
 - `Ctrl+B` then `Ctrl+B` sends a literal `Ctrl+B` on to the harness.
 - `Ctrl+B` then any other key returns to the terminal without doing anything.
 - Once the harness has exited there is nothing left to type into, so plain `q`, `Esc`, and `Ctrl+C` quit directly.

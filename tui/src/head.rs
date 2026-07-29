@@ -131,11 +131,13 @@ impl Head {
 
     /// Fall back to idling once the session has been quiet for `quiet`.
     /// Talking and thinking are both live states: neither is true any more
-    /// once the harness has stopped producing anything. Returns whether the
-    /// state changed, so a settled fleet only redraws once.
-    pub fn settle(&mut self, quiet: Duration) -> bool {
+    /// once the harness has stopped producing anything. A pending decision is
+    /// the exception - it produces no further output, but the session really is
+    /// blocked on it, so it holds the state until the captain answers.
+    /// Returns whether the state changed, so a settled fleet only redraws once.
+    pub fn settle(&mut self, quiet: Duration, decision_pending: bool) -> bool {
         let live = matches!(self.state, HeadState::Talking | HeadState::Thinking);
-        if !live || self.since.elapsed() < quiet {
+        if !live || decision_pending || self.since.elapsed() < quiet {
             return false;
         }
         self.set_state(HeadState::Idle);
@@ -241,12 +243,25 @@ mod tests {
     fn a_quiet_session_settles_back_to_idling() {
         let mut head = Head::new();
         head.set_state(HeadState::Talking);
-        assert!(!head.settle(Duration::from_secs(60)), "still live");
+        assert!(!head.settle(Duration::from_secs(60), false), "still live");
         assert_eq!(head.state, HeadState::Talking);
 
-        assert!(head.settle(Duration::ZERO));
+        assert!(head.settle(Duration::ZERO, false));
         assert_eq!(head.state, HeadState::Idle);
-        assert!(!head.settle(Duration::ZERO), "idling is already settled");
+        assert!(!head.settle(Duration::ZERO, false), "idling is already settled");
+    }
+
+    /// A decision box is a live blocked state, so the quiet timer must not
+    /// flip the figurehead to idling while the captain is being asked.
+    #[test]
+    fn a_pending_decision_holds_the_thinking_state() {
+        let mut head = Head::new();
+        head.set_state(HeadState::Thinking);
+        assert!(!head.settle(Duration::ZERO, true), "a decision is still up");
+        assert_eq!(head.state, HeadState::Thinking);
+
+        assert!(head.settle(Duration::ZERO, false), "dismissed, so it settles");
+        assert_eq!(head.state, HeadState::Idle);
     }
 
     /// A dead harness is a fact, not a lull, so it must survive the quiet timer.
@@ -254,7 +269,7 @@ mod tests {
     fn a_gone_harness_does_not_settle_to_idling() {
         let mut head = Head::new();
         head.set_state(HeadState::Gone);
-        assert!(!head.settle(Duration::ZERO));
+        assert!(!head.settle(Duration::ZERO, false));
         assert_eq!(head.state, HeadState::Gone);
     }
 }

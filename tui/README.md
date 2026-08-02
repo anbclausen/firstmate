@@ -19,6 +19,8 @@ cargo test
 cargo run
 ```
 
+CI runs `cargo test` for this crate on every PR and merge, inside the same `tui/Containerfile` build image (the `TUI crate tests` job in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)).
+
 `cargo run` on a bare host runs the same container relaunch `fm` does; set `FM_TUI_CONTAINERIZED=1` to skip it and run the TUI natively for a quick local iteration loop (no harness credential/socket mounts are set up in that mode).
 
 On first launch, no default harness is chosen yet, so the TUI shows a picker (claude, codex, opencode, pi, grok - the verified harnesses from `AGENTS.md` section 4).
@@ -29,23 +31,26 @@ Delete that file to be asked again.
 
 The screen is the agent pane framed by lightweight status regions; the pane is the centerpiece and is never dimmed.
 
-- Top: an animated ASCII-art head reflecting a simple state machine: idling, thinking, talking.
-  Extend it by adding a new `HeadState` arm in `src/head.rs`.
-- Left sidebar (`tasks`): a scrollable list of the backlog, read directly from `data/backlog.md` by `src/tasks.rs`.
+- Left (`tasks`): a scrollable list of the backlog, read directly from `data/backlog.md` by `src/tasks.rs`.
   It is a plain programmatic parse of the markdown `tasks-axi` writes (no agent involvement), grouped most-relevant-first: in-flight, then queued, then done, colour-coded by section, with held and blocked items marked.
   The backlog path is resolved off the repo root the same way `src/config.rs` resolves the harness file, and the list refreshes on a timer.
 - Centre: the agent pane, a real embedded terminal running the wrapped harness, not a rendered transcript.
   Harness output goes through a `vt100` emulator and is drawn by `tui-term` as a screen grid, so a full-screen harness renders normally instead of spilling escape codes.
   The pane's size drives the pty's size, so resizing the window re-lays-out the harness.
-- Right sidebar (`crew`): a scrollable list of firstmate's crewmate containers and their health, read programmatically from `podman ps` by `src/crew.rs`.
+- Top right: the figurehead, an animated ASCII first mate at the helm showing the live session state - idling, thinking, talking, or off watch once the harness has exited.
+  The state is driven by what the session actually does, and settles back to idling after a quiet spell rather than freezing on the last thing the harness did.
+  A pending decision box holds the state instead, since the session really is blocked on it until the captain answers.
+  The drawing is one frame with animated eye, mouth, and helm slots; extend it by adding a `HeadState` arm in `src/head.rs`.
+- Under the figurehead (`crew`): a scrollable list of firstmate's crewmate containers and their health, read programmatically from `podman ps` by `src/crew.rs`.
   Crewmates are the containers carrying a `firstmate.task` label (see `bin/backends/podman.sh`); health (working, stalled, stopped) is derived from the container state podman reports.
   The `podman ps` read runs on a background thread and refreshes on a timer, so it never blocks the UI or forks podman per frame.
-- Bottom row: the current model/harness chip on the left (`src/footer.rs`) and a context-usage indicator on the right.
-  There is no honest source for the wrapped harness's context usage yet, so the indicator renders `n/a` rather than a fabricated number; `ContextUsage::Known` in `src/footer.rs` is the wiring point for a real source.
-- Just above that: a one-line status bar which always shows who owns the keyboard and how to quit.
-- A decision box, rendered as a popup overlay on top of the agent pane, whenever the wrapped harness emits a decision (see below).
+- Bottom: a one-line status bar which always shows who owns the keyboard and how to quit.
+  The wrapped harness already shows its own model and context readouts inside the pane, so the bar does not repeat them.
+- A task detail overlay, popped over the TUI while the captain walks the backlog (see below), and a decision box, rendered as a popup overlay on top of the agent pane whenever the wrapped harness emits a decision (see below).
 
-On a terminal too narrow to seat both sidebars and a usable pane, the sidebars collapse and the pane spans the whole middle, so a small window stays usable rather than corrupting the layout.
+The tasks pane, the agent pane, and the right-hand column all start at the very top of the screen and run its full height, with only the status line below them.
+On a terminal too narrow to seat both columns and a usable pane, they collapse and the pane spans the whole width, so a small window stays usable rather than corrupting the layout.
+A short terminal shrinks the figurehead before the crew list, so the crew always keeps a usable minimum.
 
 ## Focus and quitting
 
@@ -55,12 +60,16 @@ That leaves no ordinary key free to quit on, so the TUI reserves exactly one cho
 - `Ctrl+B` switches to command mode; the status bar turns cyan to say so.
 - `Ctrl+B` then `q` quits the TUI and terminates the harness.
   This works whenever the harness owns the keyboard, which is every state except a decision box being up.
-- `Ctrl+B` then `Up`/`Down` scrolls the `tasks` sidebar, and `Ctrl+B` then `PageUp`/`PageDown` scrolls the `crew` sidebar; scroll keys keep command mode so a run of them walks the list.
+- `Ctrl+B` then `Up`/`Down` walks the `tasks` pane, and `Ctrl+B` then `PageUp`/`PageDown` scrolls the `crew` list; scroll keys keep command mode so a run of them walks the list.
+  Walking the tasks pane pops the selected task's full description - the whole bullet plus its body lines - over the TUI, since the pane can only show a clipped title.
+  It comes back down as soon as the captain scrolls the crew list, leaves command mode, or a decision box arrives, and it never comes up at all on a terminal too narrow to seat the tasks pane or once the backlog no longer has the selected task.
+  The overlay is a fixed size, so an item too long to fit is titled `task - truncated` rather than being cut off silently.
 - `Ctrl+B` then `Ctrl+B` sends a literal `Ctrl+B` on to the harness.
 - `Ctrl+B` then any other key returns to the terminal without doing anything.
 - Once the harness has exited there is nothing left to type into, so plain `q`, `Esc`, and `Ctrl+C` quit directly.
 
 `src/keys.rs` owns the key-to-bytes translation, including the control bytes, the arrow and function-key escape sequences, and the DECCKM (application cursor keys) variants a full-screen harness switches on.
+`Shift+Enter` sends a bare line feed so it opens a new line in the harness's input instead of submitting it; that needs the terminal to tell the two apart, so the TUI asks for the disambiguating keyboard protocol on startup where the terminal supports it.
 
 ## The decision protocol
 

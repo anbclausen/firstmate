@@ -24,6 +24,29 @@ jobs:
       # re-spell the shellcheck command here; keep CI and the pre-push gate on it.
       - run: bin/fm-lint.sh
 
+  # The tui/ crate's own unit tests. Run inside tui/Containerfile, the same
+  # build environment install.sh compiles the crate in, so CI proves exactly
+  # what a captain's own build uses rather than a separately pinned toolchain.
+  tui-tests:
+    name: TUI crate tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build the tui build image
+        run: podman build -t firstmate-tui-build -f tui/Containerfile tui
+      - name: Run cargo test for tui/
+        run: |
+          set -eu
+          # Source is mounted read-only and the build output goes to a
+          # container-owned path, matching install.sh's build invocation.
+          podman run --rm \
+            -v "$PWD/tui:/work/tui:ro" \
+            -e CARGO_TARGET_DIR=/home/agent/target \
+            -w /work/tui \
+            firstmate-tui-build \
+            cargo test --locked
+
   # Deterministic proof that portable parallel shards + portable serial + Herdr
   # equal the complete tests/*.test.sh inventory with no missing or duplicates.
   test-coverage:

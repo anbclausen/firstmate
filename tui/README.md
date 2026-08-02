@@ -61,8 +61,8 @@ That leaves no ordinary key free to quit on, so the TUI reserves exactly one cho
 - `Ctrl+B` then `q` quits the TUI and terminates the harness.
   This works whenever the harness owns the keyboard, which is every state except a decision box being up.
 - `Ctrl+B` then `Up`/`Down` walks the `tasks` pane, and `Ctrl+B` then `PageUp`/`PageDown` scrolls the `crew` list; scroll keys keep command mode so a run of them walks the list.
-  Walking the tasks pane pops the selected task's full description - the whole bullet plus its body lines - over the TUI, since the sidebar can only show a clipped title.
-  It comes back down as soon as the captain scrolls the crew list, leaves command mode, or a decision box arrives.
+  Walking the tasks pane pops the selected task's full description - the whole bullet plus its body lines - over the TUI, since the pane can only show a clipped title.
+  It comes back down as soon as the captain scrolls the crew list, leaves command mode, or a decision box arrives, and it never comes up at all on a terminal too narrow to seat the tasks pane or once the backlog no longer has the selected task.
   The overlay is a fixed size, so an item too long to fit is titled `task - truncated` rather than being cut off silently.
 - `Ctrl+B` then `Ctrl+B` sends a literal `Ctrl+B` on to the harness.
 - `Ctrl+B` then any other key returns to the terminal without doing anything.

@@ -62,7 +62,13 @@ impl Child {
 /// The reader thread also owns waiting on the child, because it blocks in
 /// `child.wait()` for the process's lifetime; the returned `Child` can
 /// still kill it independently through its own killer handle.
-pub fn spawn(command: &str, args: &[String], rows: u16, cols: u16) -> anyhow::Result<Child> {
+pub fn spawn(
+    command: &str,
+    args: &[String],
+    cwd: Option<&std::path::Path>,
+    rows: u16,
+    cols: u16,
+) -> anyhow::Result<Child> {
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(PtySize {
         rows,
@@ -75,6 +81,13 @@ pub fn spawn(command: &str, args: &[String], rows: u16, cols: u16) -> anyhow::Re
     cmd.args(args);
     // Without this the harness sees TERM=dumb and refuses to draw itself.
     cmd.env("TERM", "xterm-256color");
+    // Without an explicit cwd, portable-pty starts the child in the user's
+    // home (/home/agent in the runtime container), where firstmate's repo is
+    // invisible. Pin it to the bind-mounted repo root so the harness opens
+    // directly on the firstmate checkout.
+    if let Some(dir) = cwd {
+        cmd.cwd(dir);
+    }
     let mut child = pair.slave.spawn_command(cmd)?;
     drop(pair.slave);
 
@@ -150,7 +163,7 @@ mod tests {
     /// instead of observing `Exited` almost immediately.
     #[test]
     fn kill_terminates_a_long_running_child_promptly() {
-        let mut child = spawn("sleep", &["30".to_string()], 24, 80).unwrap();
+        let mut child = spawn("sleep", &["30".to_string()], None, 24, 80).unwrap();
 
         child.kill();
 
@@ -166,7 +179,7 @@ mod tests {
     /// the child. `cat` echoes it straight back down the pty.
     #[test]
     fn typed_input_reaches_the_child() {
-        let mut child = spawn("cat", &[], 24, 80).unwrap();
+        let mut child = spawn("cat", &[], None, 24, 80).unwrap();
 
         child.write_input(b"ahoy\r").unwrap();
 
@@ -179,7 +192,7 @@ mod tests {
     /// resize has to reach the kernel's terminal, not just the emulator.
     #[test]
     fn resize_changes_the_size_the_child_sees() {
-        let mut child = spawn("sh", &["-c".into(), "sleep 0.4; stty size".into()], 24, 80).unwrap();
+        let mut child = spawn("sh", &["-c".into(), "sleep 0.4; stty size".into()], None, 24, 80).unwrap();
 
         child.resize(31, 101).unwrap();
 

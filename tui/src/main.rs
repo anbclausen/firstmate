@@ -157,7 +157,7 @@ impl App {
         }
         self.harness = Some(harness);
         let (rows, cols) = self.pty_size;
-        match child::spawn(harness.command(), &[], rows, cols) {
+        match child::spawn(harness.command(), &[], Some(root), rows, cols) {
             Ok(child) => {
                 self.child = Some(child);
                 self.head.set_state(HeadState::Idle);
@@ -768,7 +768,7 @@ mod tests {
         let mut app = running_app();
         // A live pane is what makes Ctrl+C the harness's key; without one
         // there would be nothing to forward it to.
-        app.child = Some(child::spawn("cat", &[], 24, 80).unwrap());
+        app.child = Some(child::spawn("cat", &[], None, 24, 80).unwrap());
 
         assert_eq!(handle_running_key(&mut app, ctrl('c')), Step::Continue);
 
@@ -798,7 +798,7 @@ mod tests {
     #[test]
     fn plain_q_quits_only_once_the_pane_is_dead() {
         let mut app = running_app();
-        app.child = Some(child::spawn("cat", &[], 24, 80).unwrap());
+        app.child = Some(child::spawn("cat", &[], None, 24, 80).unwrap());
         assert_eq!(handle_running_key(&mut app, key(KeyCode::Char('q'))), Step::Continue);
 
         app.exited = Some(0);
@@ -841,6 +841,7 @@ mod tests {
                         "printf '{SENTINEL} {{\"prompt\":\"p\",\"options\":[\"yes\"]}}\\n'; sleep 30"
                     ),
                 ],
+                None,
                 24,
                 80,
             )
@@ -947,7 +948,7 @@ mod tests {
     #[test]
     fn the_status_bar_always_shows_the_quit_path() {
         let mut app = running_app();
-        app.child = Some(child::spawn("cat", &[], 24, 80).unwrap());
+        app.child = Some(child::spawn("cat", &[], None, 24, 80).unwrap());
 
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         terminal.draw(|frame| draw_running(frame, &app)).unwrap();
@@ -972,7 +973,7 @@ mod tests {
     #[test]
     fn harness_output_reaches_both_the_emulator_and_the_decision_scanner() {
         let mut app = running_app();
-        let mut child = child::spawn("cat", &[], 24, 80).unwrap();
+        let mut child = child::spawn("cat", &[], None, 24, 80).unwrap();
         child.write_input(b"hello\r").unwrap();
         child
             .write_input(br#"::firstmate-decision:: {"prompt":"p","options":["a"]}"#)
@@ -1187,7 +1188,7 @@ mod tests {
     #[test]
     fn command_mode_scrolls_the_sidebars_and_stays() {
         let mut app = running_app();
-        app.child = Some(child::spawn("cat", &[], 24, 80).unwrap());
+        app.child = Some(child::spawn("cat", &[], None, 24, 80).unwrap());
         app.tasks.set(tasks::parse_backlog(
             "## Queued\n- [ ] a - one (since 2026-07-27)\n- [ ] b - two (since 2026-07-27)\n",
         ));

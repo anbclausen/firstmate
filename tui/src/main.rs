@@ -277,28 +277,39 @@ fn main() -> anyhow::Result<()> {
     // new line instead of submitting. Terminals that do not support it are left
     // alone rather than sent a sequence they would print.
     let enhanced = supports_keyboard_enhancement().unwrap_or(false);
-    if enhanced {
-        execute!(
-            stdout,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        )?;
-    }
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = match Terminal::new(backend) {
+        Ok(terminal) => terminal,
+        Err(err) => {
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+            return Err(err.into());
+        }
+    };
+    if enhanced {
+        let _ = execute!(
+            terminal.backend_mut(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+    }
 
     let result = run(&mut terminal, &mut app, &root);
     app.kill_child();
 
-    if enhanced {
-        // A failed pop must not strand the captain in raw mode on the
-        // alternate screen, so the restore below always runs.
-        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
-    }
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    // A failed restore step must not strand the captain in raw mode on the
+    // alternate screen, so every step runs regardless of the previous one.
+    restore_terminal(&mut terminal, enhanced);
 
     result
+}
+
+fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, enhanced: bool) {
+    if enhanced {
+        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    }
+    let _ = disable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = terminal.show_cursor();
 }
 
 fn show_first_run_loading_screen() -> anyhow::Result<()> {
@@ -310,16 +321,18 @@ fn show_first_run_loading_screen() -> anyhow::Result<()> {
 
     let mut screen = loading::LoadingScreen::new("welcome aboard, captain - setting up the first slice");
     let start = Instant::now();
+    let mut result = Ok(());
     while start.elapsed() < Duration::from_millis(900) {
         screen.progress = ((start.elapsed().as_millis() * 100) / 900).min(100) as u16;
-        terminal.draw(|frame| screen.render(frame, frame.area()))?;
+        if let Err(err) = terminal.draw(|frame| screen.render(frame, frame.area())) {
+            result = Err(err.into());
+            break;
+        }
         std::thread::sleep(Duration::from_millis(30));
     }
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    Ok(())
+    restore_terminal(&mut terminal, false);
+    result
 }
 
 fn run(

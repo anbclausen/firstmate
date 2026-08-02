@@ -113,6 +113,10 @@ struct App {
     /// Raised by walking the backlog in command mode, dropped as soon as the
     /// captain navigates away from it.
     task_detail: bool,
+    /// Whether the last drawn layout actually seated the tasks pane; a
+    /// terminal too narrow for it must not pop a detail overlay for a pane
+    /// that is not on screen.
+    tasks_visible: bool,
 }
 
 impl App {
@@ -132,7 +136,19 @@ impl App {
             tasks: TasksPanel::new(),
             crew: CrewPanel::new(),
             task_detail: false,
+            tasks_visible: false,
         }
+    }
+
+    /// Replaces the backlog and keeps the overlay honest: a shrinking backlog
+    /// can leave the cursor on nothing, and an overlay with no task behind it
+    /// would linger invisibly.
+    fn set_tasks(&mut self, tasks: Vec<tasks::Task>) -> bool {
+        let changed = self.tasks.set(tasks);
+        if self.tasks.selected().is_none() {
+            self.task_detail = false;
+        }
+        changed
     }
 
     fn start_harness(&mut self, root: &std::path::Path, harness: Harness) {
@@ -199,7 +215,12 @@ impl App {
     /// Keeps the pty and the emulator the same size as the pane on screen,
     /// so the harness lays itself out to what the captain actually sees.
     fn sync_size(&mut self, screen: Rect) {
-        let pane = pane_rect(screen);
+        let areas = compute_layout(screen);
+        self.tasks_visible = areas.tasks.is_some();
+        if !self.tasks_visible {
+            self.task_detail = false;
+        }
+        let pane = areas.pane;
         let inner = Block::default().borders(Borders::ALL).inner(pane);
         let size = (inner.height, inner.width);
         if size.0 == 0 || size.1 == 0 || size == self.pty_size {
@@ -269,7 +290,9 @@ fn main() -> anyhow::Result<()> {
     app.kill_child();
 
     if enhanced {
-        execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags)?;
+        // A failed pop must not strand the captain in raw mode on the
+        // alternate screen, so the restore below always runs.
+        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
     }
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -323,7 +346,7 @@ fn run(
     // backlog is a cheap timed file read here, while the crew's `podman ps`
     // runs on its own thread and reports over a channel, so neither the file
     // nor podman is ever touched per frame.
-    app.tasks.set(tasks::load(root));
+    app.set_tasks(tasks::load(root));
     let crew_rx = crew::spawn_monitor(Duration::from_secs(2));
     let backlog_refresh = Duration::from_millis(1500);
     let mut last_backlog = Instant::now();
@@ -342,7 +365,7 @@ fn run(
         }
 
         if last_backlog.elapsed() >= backlog_refresh {
-            if app.tasks.set(tasks::load(root)) {
+            if app.set_tasks(tasks::load(root)) {
                 dirty = true;
             }
             last_backlog = Instant::now();
@@ -444,13 +467,13 @@ fn handle_running_key(app: &mut App, key: KeyEvent) -> Step {
                 KeyCode::Up => {
                     return command_stay(app, |a| {
                         a.tasks.scroll_up();
-                        a.task_detail = true;
+                        a.task_detail = a.tasks_visible;
                     })
                 }
                 KeyCode::Down => {
                     return command_stay(app, |a| {
                         a.tasks.scroll_down();
-                        a.task_detail = true;
+                        a.task_detail = a.tasks_visible;
                     })
                 }
                 KeyCode::PageUp => {
@@ -713,6 +736,7 @@ mod tests {
     fn running_app() -> App {
         let mut app = App::new();
         app.mode = Mode::Running;
+        app.tasks_visible = true;
         app
     }
 
@@ -1111,6 +1135,38 @@ mod tests {
         app.harness = Some(Harness::Claude);
         let _ = render_to_string(&app, 50, 20);
         let _ = render_to_string(&app, 8, 6);
+    }
+
+    /// A collapsed tasks pane has nothing for the detail overlay to belong to,
+    /// so walking the backlog must not pop it over the agent pane.
+    #[test]
+    fn a_narrow_terminal_keeps_the_task_detail_down() {
+        let mut app = running_app();
+        app.set_tasks(tasks::parse_backlog(
+            "## In flight\n- [ ] tui-layout - build it (since 2026-07-27)\n  the whole story\n",
+        ));
+        app.sync_size(Rect::new(0, 0, 50, 20));
+
+        handle_running_key(&mut app, ctrl(PREFIX));
+        handle_running_key(&mut app, key(KeyCode::Down));
+        assert!(!app.task_detail);
+        assert!(!render_to_string(&app, 50, 20).contains("the whole story"));
+    }
+
+    /// A backlog that shrinks out from under the cursor must take the overlay
+    /// with it rather than leaving it raised over nothing.
+    #[test]
+    fn an_emptied_backlog_drops_the_task_detail() {
+        let mut app = running_app();
+        app.set_tasks(tasks::parse_backlog(
+            "## In flight\n- [ ] tui-layout - build it (since 2026-07-27)\n  the whole story\n",
+        ));
+        handle_running_key(&mut app, ctrl(PREFIX));
+        handle_running_key(&mut app, key(KeyCode::Down));
+        assert!(app.task_detail);
+
+        app.set_tasks(Vec::new());
+        assert!(!app.task_detail);
     }
 
     /// Command mode scrolls the sidebars in place and only leaves for a key

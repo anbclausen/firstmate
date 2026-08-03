@@ -33,6 +33,17 @@ impl Harness {
         }
     }
 
+    /// Launch arguments the TUI adds to `command()`.
+    /// Claude starts in automode so the captain does not have to toggle it on
+    /// at every session start, matching how `run.sh` launches the primary;
+    /// the harness's own key still toggles it back off.
+    pub fn args(self) -> &'static [&'static str] {
+        match self {
+            Harness::Claude => &["--permission-mode", "auto"],
+            Harness::Codex | Harness::Opencode | Harness::Pi | Harness::Grok => &[],
+        }
+    }
+
     fn parse(s: &str) -> Option<Harness> {
         match s.trim() {
             "claude" => Some(Harness::Claude),
@@ -90,6 +101,16 @@ mod tests {
         fs::create_dir_all(dir.join("config")).unwrap();
         fs::write(config_path(&dir), "cosmo\n").unwrap();
         assert!(load_default_harness(&dir).is_none());
+    }
+
+    /// A claude session must come up in automode without the captain toggling
+    /// it, so the launch carries the permission-mode flag from the start.
+    #[test]
+    fn claude_launches_in_automode() {
+        assert_eq!(Harness::Claude.args(), ["--permission-mode", "auto"]);
+        for harness in Harness::ALL.iter().filter(|h| **h != Harness::Claude) {
+            assert!(harness.args().is_empty(), "{harness} takes no launch flags");
+        }
     }
 
     fn tempdir(label: &str) -> PathBuf {

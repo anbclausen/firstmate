@@ -157,7 +157,8 @@ impl App {
         }
         self.harness = Some(harness);
         let (rows, cols) = self.pty_size;
-        match child::spawn(harness.command(), &[], Some(root), rows, cols) {
+        let args: Vec<String> = harness.args().iter().map(|a| a.to_string()).collect();
+        match child::spawn(harness.command(), &args, Some(root), rows, cols) {
             Ok(child) => {
                 self.child = Some(child);
                 self.head.set_state(HeadState::Idle);
@@ -1102,7 +1103,7 @@ mod tests {
     #[test]
     fn walking_the_backlog_pops_the_task_detail_and_dismisses_it_on_the_way_out() {
         let mut app = running_app();
-        app.child = Some(child::spawn("cat", &[], 24, 80).unwrap());
+        app.child = Some(child::spawn("cat", &[], None, 24, 80).unwrap());
         app.tasks.set(tasks::parse_backlog(
             "## In flight\n- [ ] tui-layout - build it (since 2026-07-27)\n  the whole story of the task\n",
         ));

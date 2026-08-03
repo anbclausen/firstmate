@@ -1,13 +1,13 @@
-//! The captain-facing "figurehead": an animated ASCII first mate at the helm,
-//! reflecting what the wrapped agent is doing, so the captain can read state at
-//! a glance without watching the transcript.
+//! The captain-facing "figurehead": an ASCII ship whose posture reflects what
+//! the wrapped agent is doing, so the captain can read state at a glance
+//! without watching the transcript.
 //!
-//! The art is one fixed frame with three animated slots - the eyes, the mouth,
-//! and the helm the mate is steering - so a state is a set of slot frames
-//! rather than a whole second drawing. The state itself is live: `main.rs`
-//! sets it from what the session actually does, and `Head::settle` falls back
-//! to idling after a quiet spell rather than leaving the last thing the
-//! harness did on screen forever.
+//! The ship has two drawings - sailing when there is way on, anchored when
+//! there is not - each the same block of lines, with animated cells for the
+//! masthead pennant and the water so a live ship moves and a resting one does
+//! not. The state itself is live: `main.rs` sets it from what the session
+//! actually does, and `Head::settle` falls back to idling after a quiet spell
+//! rather than leaving the last thing the harness did on screen forever.
 
 use std::time::{Duration, Instant};
 
@@ -26,50 +26,47 @@ pub enum HeadState {
     Gone,
 }
 
-/// The art around the animated slots: `EEEEE` is the eyes, `MMM` the mouth and
-/// `H` the helm. Every state's frames are exactly their slot's width, so the
-/// drawing keeps one shape and nothing shifts as it animates.
-const FIGUREHEAD: [&str; 8] = [
-    "        _-^-_        ",
-    "     .-'     '-.     ",
-    "     '-._____.-'     ",
-    "      .-------.      ",
-    "      | EEEEE |      ",
-    "      |  MMM  |      ",
-    "      '--___--'      ",
-    "    ~~~~( H )~~~~    ",
+/// Which drawing a state gets: under way, or at rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ship {
+    Sailing,
+    Anchored,
+}
+
+/// Full sail and a wake. `P` is the masthead pennant and `W` the water; both
+/// are single cells replaced in place, so the drawing keeps one shape.
+const SAILING: [&str; 8] = [
+    "        |P           ",
+    "        |=\\          ",
+    "        |==\\         ",
+    "        |===\\        ",
+    "        |====\\       ",
+    "        |_____\\      ",
+    "     \\_________/     ",
+    "WWWWWWWWWWWWWWWWWWWWW",
 ];
 
-/// Width of the drawing above, and the narrowest pane it fits in unclipped.
+/// Sail furled on the yard, anchor down on its line.
+const ANCHORED: [&str; 8] = [
+    "        |            ",
+    "     ___|___         ",
+    "    (_______)        ",
+    "        |            ",
+    "        |            ",
+    "     \\_________/     ",
+    "WWWWWWWWWWWWWWW|WWWWW",
+    "              \\_/    ",
+];
+
+/// Width of the drawings above, and the narrowest pane they fit in unclipped.
 pub const FIGUREHEAD_WIDTH: u16 = 21;
 
 impl HeadState {
-    /// Eye frames, five cells wide.
-    fn eyes(self) -> &'static [&'static str] {
+    /// A session that is producing is under way; anything else is at rest.
+    fn ship(self) -> Ship {
         match self {
-            HeadState::Idle => &["o   o", "o   o", "o   o", "-   -"],
-            HeadState::Thinking => &["o   O", "O   o", "^   ^"],
-            HeadState::Talking => &["o   o", "O   O"],
-            HeadState::Gone => &["x   x"],
-        }
-    }
-
-    /// Mouth frames, three cells wide.
-    fn mouth(self) -> &'static [&'static str] {
-        match self {
-            HeadState::Idle => &["\\_/"],
-            HeadState::Thinking => &["'''", " ~ "],
-            HeadState::Talking => &[" o ", "\\_/", "ooo"],
-            HeadState::Gone => &["___"],
-        }
-    }
-
-    /// Helm frames, one cell wide: the wheel only turns while there is way on.
-    fn helm(self) -> &'static [&'static str] {
-        match self {
-            HeadState::Idle => &["|"],
-            HeadState::Thinking | HeadState::Talking => &["|", "/", "-", "\\"],
-            HeadState::Gone => &["x"],
+            HeadState::Thinking | HeadState::Talking => Ship::Sailing,
+            HeadState::Idle | HeadState::Gone => Ship::Anchored,
         }
     }
 
@@ -92,15 +89,41 @@ impl HeadState {
     }
 }
 
+/// One water cell: a wake running under a sailing ship, still water under an
+/// anchored one.
+fn water(ship: Ship, col: usize, tick: usize) -> char {
+    match ship {
+        Ship::Sailing => {
+            if (col + tick) % 4 == 0 {
+                '-'
+            } else {
+                '~'
+            }
+        }
+        Ship::Anchored => '~',
+    }
+}
+
 /// One rendered frame of the figurehead for `state` at animation step `tick`.
 /// Pure, so the state-to-art mapping is testable without a terminal.
 fn figurehead_frame(state: HeadState, tick: usize) -> Vec<String> {
-    let eyes = state.eyes()[tick % state.eyes().len()];
-    let mouth = state.mouth()[tick % state.mouth().len()];
-    let helm = state.helm()[tick % state.helm().len()];
-    FIGUREHEAD
-        .iter()
-        .map(|line| line.replace("EEEEE", eyes).replace("MMM", mouth).replace('H', helm))
+    let ship = state.ship();
+    let art = match ship {
+        Ship::Sailing => &SAILING,
+        Ship::Anchored => &ANCHORED,
+    };
+    let pennant = ['>', '>', '~', '-'][tick % 4];
+    art.iter()
+        .map(|line| {
+            line.chars()
+                .enumerate()
+                .map(|(col, cell)| match cell {
+                    'W' => water(ship, col, tick),
+                    'P' => pennant,
+                    other => other,
+                })
+                .collect()
+        })
         .collect()
 }
 
@@ -206,15 +229,37 @@ mod tests {
         assert_eq!(head.tick, 1);
     }
 
-    /// The slots have to be exactly the width of their placeholders, or the
-    /// drawing shifts around as it animates.
+    /// A producing session is under way; anything else is at rest.
     #[test]
-    fn every_state_has_frames_that_fit_their_slots() {
-        for state in ALL {
-            assert!(!state.eyes().is_empty());
-            assert!(state.eyes().iter().all(|f| f.chars().count() == 5));
-            assert!(state.mouth().iter().all(|f| f.chars().count() == 3));
-            assert!(state.helm().iter().all(|f| f.chars().count() == 1));
+    fn only_a_live_session_is_under_sail() {
+        assert_eq!(HeadState::Thinking.ship(), Ship::Sailing);
+        assert_eq!(HeadState::Talking.ship(), Ship::Sailing);
+        assert_eq!(HeadState::Idle.ship(), Ship::Anchored);
+        assert_eq!(HeadState::Gone.ship(), Ship::Anchored);
+    }
+
+    /// The two drawings must be interchangeable in the head area, so they have
+    /// to be the same block of lines at the same width.
+    #[test]
+    fn both_ships_are_the_same_size() {
+        for art in [SAILING, ANCHORED] {
+            assert_eq!(art.len(), 8);
+            assert!(art
+                .iter()
+                .all(|line| line.chars().count() == usize::from(FIGUREHEAD_WIDTH)));
+        }
+    }
+
+    /// Only the sailing ship moves; an anchored one must sit still rather than
+    /// churning a wake it is not making.
+    #[test]
+    fn the_wake_only_runs_under_sail() {
+        let sailing: Vec<_> = (0..4).map(|t| figurehead_frame(HeadState::Talking, t)).collect();
+        assert!(sailing.windows(2).any(|pair| pair[0] != pair[1]));
+
+        let resting = figurehead_frame(HeadState::Idle, 0);
+        for tick in 0..8 {
+            assert_eq!(figurehead_frame(HeadState::Idle, tick), resting);
         }
     }
 
@@ -225,13 +270,13 @@ mod tests {
         for state in ALL {
             for tick in 0..12 {
                 let art = figurehead_frame(state, tick);
-                assert_eq!(art.len(), FIGUREHEAD.len());
+                assert_eq!(art.len(), SAILING.len());
                 assert!(art
                     .iter()
                     .all(|line| line.chars().count() == usize::from(FIGUREHEAD_WIDTH)));
                 assert!(
-                    !art.concat().contains('E') && !art.concat().contains('M'),
-                    "a slot was left unfilled in {art:?}"
+                    !art.concat().contains('W') && !art.concat().contains('P'),
+                    "a cell was left unfilled in {art:?}"
                 );
             }
         }

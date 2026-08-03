@@ -24,7 +24,7 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Text};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Terminal;
 use tui_term::widget::{Cursor, PseudoTerminal};
@@ -661,7 +661,29 @@ fn draw_running(frame: &mut ratatui::Frame, app: &App) {
         .cursor(Cursor::default().visibility(cursor_visible));
     frame.render_widget(pane, areas.pane);
 
-    frame.render_widget(status_bar(app), areas.status);
+    let (hint, hint_style, legend_allowed) = status_hint(app);
+    let mut status_area = areas.status;
+    if legend_allowed {
+        // The legend only takes room the hint is not using, so a narrow
+        // terminal keeps the whole bar for the keys.
+        let budget = status_area
+            .width
+            .saturating_sub(hint.chars().count() as u16 + 1);
+        if let Some(legend) = legend_line(budget) {
+            let width = legend.width() as u16;
+            let legend_area = Rect {
+                x: status_area.x + status_area.width - width,
+                width,
+                ..status_area
+            };
+            status_area.width -= width;
+            frame.render_widget(Paragraph::new(legend), legend_area);
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(hint)).style(hint_style),
+        status_area,
+    );
 
     // The detail overlay is up only while the captain is walking the backlog,
     // and a decision box outranks it.
@@ -679,8 +701,9 @@ fn draw_running(frame: &mut ratatui::Frame, app: &App) {
 }
 
 /// The one always-visible reminder of who owns the keyboard and how to get
-/// out, since Ctrl+C now belongs to the harness.
-fn status_bar(app: &App) -> Paragraph<'static> {
+/// out, since Ctrl+C now belongs to the harness. The third field says whether
+/// the legend may share the bar: an alert keeps the whole width.
+fn status_hint(app: &App) -> (String, Style, bool) {
     let (text, style) = if let Some(notice) = &app.notice {
         (
             format!(" {notice} "),
@@ -717,7 +740,86 @@ fn status_bar(app: &App) -> Paragraph<'static> {
         }
     };
 
-    Paragraph::new(Line::from(text)).style(style)
+    let legend_allowed = app.notice.is_none()
+        && app.exited.is_none()
+        && app.child.is_some()
+        && app.decision.is_none();
+    (text, style, legend_allowed)
+}
+
+/// One legend chunk: a pane heading, or a swatch and what it means. The
+/// meanings are the ones `tasks::task_item` and `crew::crew_item` paint, so a
+/// change there has to be mirrored here.
+struct LegendChunk {
+    spans: Vec<Span<'static>>,
+    heading: bool,
+}
+
+fn swatch(glyph: &'static str, color: Color, label: &'static str) -> LegendChunk {
+    LegendChunk {
+        spans: vec![
+            Span::styled(glyph, Style::default().fg(color)),
+            Span::styled(format!(" {label}  "), Style::default().fg(Color::DarkGray)),
+        ],
+        heading: false,
+    }
+}
+
+fn heading(text: &'static str) -> LegendChunk {
+    LegendChunk {
+        spans: vec![Span::styled(
+            text,
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )],
+        heading: true,
+    }
+}
+
+/// The legend, trimmed to `budget` columns by dropping whole entries off the
+/// end - and any pane heading left with nothing under it - so a narrow
+/// terminal loses meanings rather than overflowing the bar.
+fn legend_line(budget: u16) -> Option<Line<'static>> {
+    let mut chunks = vec![
+        heading("tasks "),
+        swatch(">", Color::Cyan, "in flight"),
+        swatch("-", Color::Gray, "queued"),
+        swatch("x", Color::DarkGray, "done"),
+        swatch("[hold]", Color::DarkGray, "held/blocked"),
+        heading("crew "),
+        swatch("+", Color::Green, "working"),
+        swatch("!", Color::Yellow, "stalled"),
+        swatch("x", Color::Red, "stopped"),
+        swatch("?", Color::DarkGray, "unknown"),
+        LegendChunk {
+            spans: vec![
+                Span::styled(" ", Style::default().add_modifier(Modifier::REVERSED)),
+                Span::styled(" selected", Style::default().fg(Color::DarkGray)),
+            ],
+            heading: false,
+        },
+    ];
+
+    let width = |chunks: &[LegendChunk]| -> usize {
+        chunks
+            .iter()
+            .flat_map(|c| c.spans.iter())
+            .map(|s| s.content.chars().count())
+            .sum()
+    };
+    while !chunks.is_empty()
+        && (width(&chunks) > budget as usize || chunks.last().is_some_and(|c| c.heading))
+    {
+        chunks.pop();
+    }
+
+    if chunks.is_empty() {
+        return None;
+    }
+    Some(Line::from(
+        chunks.into_iter().flat_map(|c| c.spans).collect::<Vec<_>>(),
+    ))
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: ratatui::layout::Rect) -> ratatui::layout::Rect {
@@ -967,6 +1069,34 @@ mod tests {
         );
     }
 
+    /// The legend explains the panes' colours, and a narrow bar has to lose
+    /// meanings from the end rather than overflow - never leaving a pane
+    /// heading with nothing under it.
+    #[test]
+    fn the_legend_trims_to_the_width_it_is_given() {
+        let full = legend_line(200).expect("a wide bar shows the whole legend");
+        let text: String = full.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("in flight") && text.contains("stopped"),
+            "{text}"
+        );
+        assert!(full.width() <= 200);
+
+        for budget in 0..=80u16 {
+            match legend_line(budget) {
+                Some(line) => {
+                    assert!(line.width() <= budget as usize, "overflowed at {budget}");
+                    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                    assert!(
+                        !text.trim_end().ends_with("crew") && !text.trim_end().ends_with("tasks"),
+                        "dangling heading at {budget}: {text:?}"
+                    );
+                }
+                None => assert!(budget < 20, "gave up too early at {budget}"),
+            }
+        }
+    }
+
     /// End to end over a real pty: harness output is a byte stream the
     /// emulator renders, and the decision sentinel still has to be spotted
     /// in that same stream.
@@ -1102,7 +1232,7 @@ mod tests {
     #[test]
     fn walking_the_backlog_pops_the_task_detail_and_dismisses_it_on_the_way_out() {
         let mut app = running_app();
-        app.child = Some(child::spawn("cat", &[], 24, 80).unwrap());
+        app.child = Some(child::spawn("cat", &[], None, 24, 80).unwrap());
         app.tasks.set(tasks::parse_backlog(
             "## In flight\n- [ ] tui-layout - build it (since 2026-07-27)\n  the whole story of the task\n",
         ));

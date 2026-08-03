@@ -37,11 +37,13 @@ The screen is the agent pane framed by lightweight status regions; the pane is t
 - Centre: the agent pane, a real embedded terminal running the wrapped harness, not a rendered transcript.
   Harness output goes through a `vt100` emulator and is drawn by `tui-term` as a screen grid, so a full-screen harness renders normally instead of spilling escape codes.
   The pane's size drives the pty's size, so resizing the window re-lays-out the harness.
-- Top right: the figurehead, an animated ASCII first mate at the helm showing the live session state - idling, thinking, talking, or off watch once the harness has exited.
+- Top right: the figurehead, an animated ASCII ship showing the live session state - idling, thinking, sailing, or off watch once the harness has exited.
   The state is driven by what the session actually does, and settles back to idling after a quiet spell rather than freezing on the last thing the harness did.
   A pending decision box holds the state instead, since the session really is blocked on it until the captain answers.
-  The drawing is one frame with animated eye, mouth, and helm slots; extend it by adding a `HeadState` arm in `src/head.rs`.
-  Settling back to idling, and a decision box arriving, are the two moments the session comes to rest on the captain, so each sounds one notification ping (`src/ping.rs`) - once per transition, never while it sits idle.
+  It is one three-masted ship drawn in two postures - under full sail, or with her sails furled and her anchor down - identical but for the sails, the anchor, the masthead pennant and the water, so a change of state reads as the same ship rather than a different vessel.
+  The loading screen draws that same ship from `src/head.rs`; extend the drawing by adding a `HeadState` arm there.
+  A harness turn ending, and a decision box arriving, are the two moments the session comes to rest on the captain, so each sounds one notification ping (`src/ping.rs`) - once per transition, never while it sits idle.
+  The harness echoes the captain's own keystrokes back as output, so the ship goes under sail while they type; the turn only passes to the harness when they submit, and only the end of a harness turn pings, so typing and then pausing is silent.
 - Under the figurehead (`crew`): a scrollable list of firstmate's crewmate containers and their health, read programmatically from `podman ps` by `src/crew.rs`.
   Crewmates are the containers carrying a `firstmate.task` label (see `bin/backends/podman.sh`); health (working, stalled, stopped) is derived from the container state podman reports.
   The `podman ps` read runs on a background thread and refreshes on a timer, so it never blocks the UI or forks podman per frame.

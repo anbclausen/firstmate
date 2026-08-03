@@ -34,7 +34,7 @@ use child::{Child, ChildEvent};
 use config::Harness;
 use crew::CrewPanel;
 use decision_box::DecisionBox;
-use head::{Head, HeadState};
+use head::{Head, HeadState, Settled};
 use tasks::TasksPanel;
 
 /// Pty size used before the first draw has told us what the pane is; the
@@ -80,6 +80,13 @@ const PREFIX: char = 'b';
 
 fn is_prefix(key: KeyEvent) -> bool {
     key.code == KeyCode::Char(PREFIX) && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+/// Whether a keystroke hands the turn to the harness. A plain Enter submits
+/// what the captain typed; Shift+Enter only opens a new line in the harness's
+/// input, so it is still the captain's turn (`keys.rs`).
+fn is_submit(key: KeyEvent) -> bool {
+    key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT)
 }
 
 /// Whether a keystroke should end the event loop.
@@ -190,7 +197,7 @@ impl App {
         for event in events {
             match event {
                 ChildEvent::Output(bytes) => {
-                    self.head.set_state(HeadState::Talking);
+                    self.head.set_state(HeadState::Sailing);
                     self.parser.process(&bytes);
                 }
                 ChildEvent::Decision(decision) => {
@@ -245,6 +252,15 @@ impl App {
         let Some(bytes) = keys::encode(key, modes) else {
             return;
         };
+        // The harness echoes these bytes straight back as output, which is
+        // indistinguishable from work it is doing; telling the head whose turn
+        // it is now is what stops a pause in the captain's typing being read as
+        // the harness handing the keyboard back.
+        if is_submit(key) {
+            self.head.captain_submitted();
+        } else {
+            self.head.captain_typed();
+        }
         if let Some(Err(err)) = self.child.as_mut().map(|c| c.write_input(&bytes)) {
             self.notice = Some(format!("could not reach the harness: {err}"));
         }
@@ -413,12 +429,17 @@ fn run(
             }
         }
 
-        // Settling is exactly the transition into waiting on the captain, and
-        // it reports that transition once, so the ping never repeats while the
-        // session sits idle.
-        if app.head.settle(HEAD_QUIET, app.decision.is_some()) {
-            dirty = true;
-            ping::ping();
+        // A lull always brings the ship to rest, but only the end of a harness
+        // turn is the captain's turn arriving, and it is reported once, so the
+        // ping neither repeats while the session sits idle nor answers the
+        // captain's own typing.
+        match app.head.settle(HEAD_QUIET, app.decision.is_some()) {
+            Settled::Unchanged => {}
+            Settled::Quiet => dirty = true,
+            Settled::YourTurn => {
+                dirty = true;
+                ping::ping();
+            }
         }
 
         if last_tick.elapsed() >= tick_rate {
@@ -1228,12 +1249,58 @@ mod tests {
         let mut app = running_app();
         assert!(render_to_string(&app, 100, 40).contains("idling"));
 
-        app.head.set_state(HeadState::Talking);
-        assert!(render_to_string(&app, 100, 40).contains("talking"));
+        app.head.set_state(HeadState::Sailing);
+        assert!(render_to_string(&app, 100, 40).contains("sailing"));
 
         app.exited = Some(0);
         app.head.set_state(HeadState::Gone);
         assert!(render_to_string(&app, 100, 40).contains("off watch"));
+    }
+
+    /// The captain typing and then pausing rang the ping at them: the harness
+    /// echoes their keystrokes back, which put the ship under sail, and the
+    /// pause that followed looked exactly like a turn ending. Only a turn the
+    /// captain actually handed over may ring.
+    #[test]
+    fn the_captains_own_typing_never_arms_the_ping() {
+        let mut app = running_app();
+        app.child = Some(child::spawn("cat", &[], None, 24, 80).unwrap());
+
+        for c in "ahoy".chars() {
+            handle_running_key(&mut app, key(KeyCode::Char(c)));
+        }
+        // What the harness echoes back is those same keystrokes.
+        app.head.set_state(HeadState::Sailing);
+        assert_eq!(
+            app.head.settle(Duration::ZERO, false),
+            Settled::Quiet,
+            "a pause mid-sentence is not the captain's turn"
+        );
+
+        // Submitting hands the turn over, so the lull at the end of the work
+        // that follows is the real one.
+        handle_running_key(&mut app, key(KeyCode::Enter));
+        app.head.set_state(HeadState::Sailing);
+        assert_eq!(app.head.settle(Duration::ZERO, false), Settled::YourTurn);
+
+        app.kill_child();
+    }
+
+    /// Shift+Enter opens a new line in the harness's input rather than
+    /// submitting, so the captain is still mid-sentence.
+    #[test]
+    fn shift_enter_does_not_hand_the_turn_over() {
+        let mut app = running_app();
+        app.child = Some(child::spawn("cat", &[], None, 24, 80).unwrap());
+
+        handle_running_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+        );
+        app.head.set_state(HeadState::Sailing);
+        assert_eq!(app.head.settle(Duration::ZERO, false), Settled::Quiet);
+
+        app.kill_child();
     }
 
     /// Walking the backlog pops the whole item over the TUI, because the

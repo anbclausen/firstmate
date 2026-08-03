@@ -21,7 +21,7 @@ use ratatui::Frame;
 pub enum HeadState {
     Idle,
     Thinking,
-    Talking,
+    Sailing,
     /// The harness is gone; the mate has left the helm.
     Gone,
 }
@@ -33,39 +33,43 @@ enum Ship {
     Anchored,
 }
 
-/// Full sail and a wake. `P` is the masthead pennant and `W` the water; both
-/// are single cells replaced in place, so the drawing keeps one shape.
+/// One three-masted ship, drawn twice. The hull, deck and masts below are
+/// character-for-character the same in both drawings: only the sails, the
+/// anchor, the `P` masthead pennant and the `W` water differ, so the captain
+/// reads a change of posture rather than a change of vessel. `P` and `W` are
+/// single cells replaced in place, so the drawing keeps one shape as it moves.
 const SAILING: [&str; 8] = [
-    "        |P           ",
-    "        |=\\          ",
-    "        |==\\         ",
-    "        |===\\        ",
-    "        |====\\       ",
-    "        |_____\\      ",
-    "     \\_________/     ",
-    "WWWWWWWWWWWWWWWWWWWWW",
+    "        |    |P   |        ",
+    "       )_)  )_)  )_)       ",
+    "      )___))___))___)      ",
+    "     )____)_____)____)     ",
+    "   _____|____|____|_____   ",
+    "   \\                   /   ",
+    "    \\_________________/    ",
+    "WWWWWWWWWWWWWWWWWWWWWWWWWWW",
 ];
 
-/// Sail furled on the yard, anchor down on its line.
+/// The same ship with her sails furled on the yards and her anchor down on
+/// its cable over the bow.
 const ANCHORED: [&str; 8] = [
-    "        |            ",
-    "     ___|___         ",
-    "    (_______)        ",
-    "        |            ",
-    "        |            ",
-    "     \\_________/     ",
-    "WWWWWWWWWWWWWWW|WWWWW",
-    "              \\_/    ",
+    "        |    |    |        ",
+    "       _|_  _|_  _|_       ",
+    "        |    |    |        ",
+    "       _|_  _|_  _|_       ",
+    "   _____|____|____|_____   ",
+    "  |\\                   /   ",
+    "   |\\_________________/    ",
+    "WW\\_/WWWWWWWWWWWWWWWWWWWWWW",
 ];
 
 /// Width of the drawings above, and the narrowest pane they fit in unclipped.
-pub const FIGUREHEAD_WIDTH: u16 = 21;
+pub const FIGUREHEAD_WIDTH: u16 = 27;
 
 impl HeadState {
     /// A session that is producing is under way; anything else is at rest.
     fn ship(self) -> Ship {
         match self {
-            HeadState::Thinking | HeadState::Talking => Ship::Sailing,
+            HeadState::Thinking | HeadState::Sailing => Ship::Sailing,
             HeadState::Idle | HeadState::Gone => Ship::Anchored,
         }
     }
@@ -74,7 +78,7 @@ impl HeadState {
         match self {
             HeadState::Idle => Color::Gray,
             HeadState::Thinking => Color::Yellow,
-            HeadState::Talking => Color::Cyan,
+            HeadState::Sailing => Color::Cyan,
             HeadState::Gone => Color::Red,
         }
     }
@@ -83,7 +87,7 @@ impl HeadState {
         match self {
             HeadState::Idle => "idling",
             HeadState::Thinking => "thinking",
-            HeadState::Talking => "talking",
+            HeadState::Sailing => "sailing",
             HeadState::Gone => "off watch",
         }
     }
@@ -105,8 +109,9 @@ fn water(ship: Ship, col: usize, tick: usize) -> char {
 }
 
 /// One rendered frame of the figurehead for `state` at animation step `tick`.
-/// Pure, so the state-to-art mapping is testable without a terminal.
-fn figurehead_frame(state: HeadState, tick: usize) -> Vec<String> {
+/// Pure, so the state-to-art mapping is testable without a terminal, and
+/// shared with the loading screen so first launch shows the same vessel.
+pub fn figurehead_frame(state: HeadState, tick: usize) -> Vec<String> {
     let ship = state.ship();
     let art = match ship {
         Ship::Sailing => &SAILING,
@@ -127,12 +132,37 @@ fn figurehead_frame(state: HeadState, tick: usize) -> Vec<String> {
         .collect()
 }
 
+/// Whose turn the session is on.
+///
+/// The harness echoes the captain's own keystrokes back down the pty, so
+/// output alone cannot tell work apart from an echo of what the captain just
+/// typed. The turn can: it is the harness's only from the moment the captain
+/// submits until the session comes to rest again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Turn {
+    Captain,
+    Harness,
+}
+
+/// What a lull amounted to, since only one of the two is worth a ping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Settled {
+    /// Still live, or already at rest: nothing to redraw.
+    Unchanged,
+    /// The ship came to rest, but on the captain's own turn - typing that the
+    /// harness echoed back, not work it did.
+    Quiet,
+    /// The harness finished its turn and handed the keyboard back.
+    YourTurn,
+}
+
 pub struct Head {
     state: HeadState,
     tick: usize,
     /// When the current state was last confirmed by something the session
     /// actually did; `settle` reads it to fall back to idling.
     since: Instant,
+    turn: Turn,
 }
 
 impl Head {
@@ -141,7 +171,23 @@ impl Head {
             state: HeadState::Idle,
             tick: 0,
             since: Instant::now(),
+            // Nothing has been asked of the harness yet, so the first lull is
+            // the captain's own, not a turn coming back to them.
+            turn: Turn::Captain,
         }
+    }
+
+    /// The captain typed something that is not a submission. Whatever the
+    /// harness echoes back is their own keystrokes, so the lull that follows
+    /// is them pausing mid-sentence rather than the session handing back.
+    pub fn captain_typed(&mut self) {
+        self.turn = Turn::Captain;
+    }
+
+    /// The captain submitted: from here the output is the harness's own work,
+    /// and the lull at the end of it is the real "your turn, captain".
+    pub fn captain_submitted(&mut self) {
+        self.turn = Turn::Harness;
     }
 
     pub fn set_state(&mut self, state: HeadState) {
@@ -153,18 +199,27 @@ impl Head {
     }
 
     /// Fall back to idling once the session has been quiet for `quiet`.
-    /// Talking and thinking are both live states: neither is true any more
+    /// Sailing and thinking are both live states: neither is true any more
     /// once the harness has stopped producing anything. A pending decision is
     /// the exception - it produces no further output, but the session really is
     /// blocked on it, so it holds the state until the captain answers.
-    /// Returns whether the state changed, so a settled fleet only redraws once.
-    pub fn settle(&mut self, quiet: Duration, decision_pending: bool) -> bool {
-        let live = matches!(self.state, HeadState::Talking | HeadState::Thinking);
+    ///
+    /// Reports the lull once, so a settled fleet only redraws and only pings
+    /// once, and reports it as the captain's turn only when the harness was
+    /// the one working: the captain typing and pausing settles the ship
+    /// without ringing at them for their own keystrokes.
+    pub fn settle(&mut self, quiet: Duration, decision_pending: bool) -> Settled {
+        let live = matches!(self.state, HeadState::Sailing | HeadState::Thinking);
         if !live || decision_pending || self.since.elapsed() < quiet {
-            return false;
+            return Settled::Unchanged;
         }
         self.set_state(HeadState::Idle);
-        true
+        // Handing back ends the harness's turn; the next one starts when the
+        // captain submits again.
+        match std::mem::replace(&mut self.turn, Turn::Captain) {
+            Turn::Harness => Settled::YourTurn,
+            Turn::Captain => Settled::Quiet,
+        }
     }
 
     /// Advance the animation by one frame; call this on a fixed timer.
@@ -207,9 +262,18 @@ mod tests {
     const ALL: [HeadState; 4] = [
         HeadState::Idle,
         HeadState::Thinking,
-        HeadState::Talking,
+        HeadState::Sailing,
         HeadState::Gone,
     ];
+
+    /// A head that has been handed a turn, which is what the captain
+    /// submitting to the harness does.
+    fn working() -> Head {
+        let mut head = Head::new();
+        head.captain_submitted();
+        head.set_state(HeadState::Sailing);
+        head
+    }
 
     #[test]
     fn switching_state_resets_the_animation_tick() {
@@ -233,7 +297,7 @@ mod tests {
     #[test]
     fn only_a_live_session_is_under_sail() {
         assert_eq!(HeadState::Thinking.ship(), Ship::Sailing);
-        assert_eq!(HeadState::Talking.ship(), Ship::Sailing);
+        assert_eq!(HeadState::Sailing.ship(), Ship::Sailing);
         assert_eq!(HeadState::Idle.ship(), Ship::Anchored);
         assert_eq!(HeadState::Gone.ship(), Ship::Anchored);
     }
@@ -250,11 +314,33 @@ mod tests {
         }
     }
 
+    /// The two postures are one vessel: a change of state must read as the
+    /// same ship taking in sail, not as a different ship sailing in.
+    #[test]
+    fn the_two_postures_draw_the_same_ship() {
+        assert_eq!(SAILING[4], ANCHORED[4], "the deck is the same line in both");
+        assert_eq!(
+            masts(SAILING[4]),
+            masts(ANCHORED[0]),
+            "the masts stand in the same columns"
+        );
+        assert_eq!(masts(SAILING[0]), masts(ANCHORED[0]));
+    }
+
+    /// The columns a drawing's masts stand in.
+    fn masts(line: &str) -> Vec<usize> {
+        line.chars()
+            .enumerate()
+            .filter(|(_, c)| *c == '|')
+            .map(|(col, _)| col)
+            .collect()
+    }
+
     /// Only the sailing ship moves; an anchored one must sit still rather than
     /// churning a wake it is not making.
     #[test]
     fn the_wake_only_runs_under_sail() {
-        let sailing: Vec<_> = (0..4).map(|t| figurehead_frame(HeadState::Talking, t)).collect();
+        let sailing: Vec<_> = (0..4).map(|t| figurehead_frame(HeadState::Sailing, t)).collect();
         assert!(sailing.windows(2).any(|pair| pair[0] != pair[1]));
 
         let resting = figurehead_frame(HeadState::Idle, 0);
@@ -286,28 +372,68 @@ mod tests {
     /// while the harness is producing must not outlive it.
     #[test]
     fn a_quiet_session_settles_back_to_idling() {
-        let mut head = Head::new();
-        head.set_state(HeadState::Talking);
-        assert!(!head.settle(Duration::from_secs(60), false), "still live");
-        assert_eq!(head.state, HeadState::Talking);
+        let mut head = working();
+        assert_eq!(
+            head.settle(Duration::from_secs(60), false),
+            Settled::Unchanged,
+            "still live"
+        );
+        assert_eq!(head.state, HeadState::Sailing);
 
-        assert!(head.settle(Duration::ZERO, false));
+        assert_eq!(head.settle(Duration::ZERO, false), Settled::YourTurn);
         assert_eq!(head.state, HeadState::Idle);
-        assert!(!head.settle(Duration::ZERO, false), "idling is already settled");
+        assert_eq!(
+            head.settle(Duration::ZERO, false),
+            Settled::Unchanged,
+            "idling is already settled"
+        );
     }
 
     /// The notification ping hangs off this transition, so a session left
     /// idling has to keep reporting no change however long it sits there.
     #[test]
     fn settling_reports_the_transition_once_per_lull() {
-        let mut head = Head::new();
-        head.set_state(HeadState::Talking);
-        assert!(head.settle(Duration::ZERO, false), "the lull begins");
+        let mut head = working();
+        assert_eq!(head.settle(Duration::ZERO, false), Settled::YourTurn, "the lull begins");
         for _ in 0..5 {
-            assert!(!head.settle(Duration::ZERO, false), "already idling");
+            assert_eq!(head.settle(Duration::ZERO, false), Settled::Unchanged, "already idling");
         }
-        head.set_state(HeadState::Talking);
-        assert!(head.settle(Duration::ZERO, false), "a fresh lull reports again");
+        head.captain_submitted();
+        head.set_state(HeadState::Sailing);
+        assert_eq!(
+            head.settle(Duration::ZERO, false),
+            Settled::YourTurn,
+            "a fresh turn reports again"
+        );
+    }
+
+    /// The bug: the harness echoes what the captain types back as output, so
+    /// typing and then pausing looked exactly like the harness finishing a
+    /// turn and rang the ping at the captain for their own keystrokes.
+    #[test]
+    fn the_captains_own_typing_settles_without_taking_the_turn() {
+        let mut head = Head::new();
+        head.captain_typed();
+        head.set_state(HeadState::Sailing);
+
+        assert_eq!(
+            head.settle(Duration::ZERO, false),
+            Settled::Quiet,
+            "the captain pausing mid-sentence is not their turn arriving"
+        );
+        assert_eq!(head.state, HeadState::Idle, "the ship still comes to rest");
+    }
+
+    /// A turn belongs to the harness only until it hands back, so more echoed
+    /// keystrokes after it must not ring a second time.
+    #[test]
+    fn a_turn_is_handed_back_only_once() {
+        let mut head = working();
+        assert_eq!(head.settle(Duration::ZERO, false), Settled::YourTurn);
+
+        head.captain_typed();
+        head.set_state(HeadState::Sailing);
+        assert_eq!(head.settle(Duration::ZERO, false), Settled::Quiet);
     }
 
     /// A decision box is a live blocked state, so the quiet timer must not
@@ -315,11 +441,20 @@ mod tests {
     #[test]
     fn a_pending_decision_holds_the_thinking_state() {
         let mut head = Head::new();
+        head.captain_submitted();
         head.set_state(HeadState::Thinking);
-        assert!(!head.settle(Duration::ZERO, true), "a decision is still up");
+        assert_eq!(
+            head.settle(Duration::ZERO, true),
+            Settled::Unchanged,
+            "a decision is still up"
+        );
         assert_eq!(head.state, HeadState::Thinking);
 
-        assert!(head.settle(Duration::ZERO, false), "dismissed, so it settles");
+        assert_eq!(
+            head.settle(Duration::ZERO, false),
+            Settled::YourTurn,
+            "dismissed, so it settles"
+        );
         assert_eq!(head.state, HeadState::Idle);
     }
 
@@ -328,7 +463,7 @@ mod tests {
     fn a_gone_harness_does_not_settle_to_idling() {
         let mut head = Head::new();
         head.set_state(HeadState::Gone);
-        assert!(!head.settle(Duration::ZERO, false));
+        assert_eq!(head.settle(Duration::ZERO, false), Settled::Unchanged);
         assert_eq!(head.state, HeadState::Gone);
     }
 }

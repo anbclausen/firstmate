@@ -41,6 +41,7 @@ The screen is the agent pane framed by lightweight status regions; the pane is t
   The state is driven by what the session actually does, and settles back to idling after a quiet spell rather than freezing on the last thing the harness did.
   A pending decision box holds the state instead, since the session really is blocked on it until the captain answers.
   The drawing is one frame with animated eye, mouth, and helm slots; extend it by adding a `HeadState` arm in `src/head.rs`.
+  Settling back to idling, and a decision box arriving, are the two moments the session comes to rest on the captain, so each sounds one notification ping (`src/ping.rs`) - once per transition, never while it sits idle.
 - Under the figurehead (`crew`): a scrollable list of firstmate's crewmate containers and their health, read programmatically from `podman ps` by `src/crew.rs`.
   Crewmates are the containers carrying a `firstmate.task` label (see `bin/backends/podman.sh`); health (working, stalled, stopped) is derived from the container state podman reports.
   The `podman ps` read runs on a background thread and refreshes on a timer, so it never blocks the UI or forks podman per frame.

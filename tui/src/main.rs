@@ -6,6 +6,7 @@ mod decision_box;
 mod head;
 mod keys;
 mod loading;
+mod ping;
 mod tasks;
 
 use std::io;
@@ -193,6 +194,9 @@ impl App {
                 }
                 ChildEvent::Decision(decision) => {
                     self.head.set_state(HeadState::Thinking);
+                    // The other way the session comes to rest on the captain,
+                    // and it arrives exactly once per decision.
+                    ping::ping();
                     self.decision = Some(DecisionBox::new(decision));
                     // The overlay owns the keyboard, so a half-entered
                     // prefix chord and a task detail popped over the TUI must
@@ -408,8 +412,12 @@ fn run(
             }
         }
 
+        // Settling is exactly the transition into waiting on the captain, and
+        // it reports that transition once, so the ping never repeats while the
+        // session sits idle.
         if app.head.settle(HEAD_QUIET, app.decision.is_some()) {
             dirty = true;
+            ping::ping();
         }
 
         if last_tick.elapsed() >= tick_rate {
@@ -1102,7 +1110,7 @@ mod tests {
     #[test]
     fn walking_the_backlog_pops_the_task_detail_and_dismisses_it_on_the_way_out() {
         let mut app = running_app();
-        app.child = Some(child::spawn("cat", &[], 24, 80).unwrap());
+        app.child = Some(child::spawn("cat", &[], None, 24, 80).unwrap());
         app.tasks.set(tasks::parse_backlog(
             "## In flight\n- [ ] tui-layout - build it (since 2026-07-27)\n  the whole story of the task\n",
         ));

@@ -1597,6 +1597,15 @@ LAUNCH=${LAUNCH//__PIEXT__/$sq_piext}
 LAUNCH=${LAUNCH//__PITURNEND__/$sq_piturnend}
 LAUNCH=${LAUNCH//__PIWATCH__/$sq_piwatch}
 LAUNCH=${LAUNCH//__OPINPUT__/$sq_opinput}
+if [ "$BACKEND" = podman ]; then
+  # Record the fully resolved launch line so bin/fm-podman-reseed.sh can
+  # restart a container's agent in place after re-seeding expired credentials,
+  # instead of a full teardown. podman only: every other backend's crewmate
+  # shares the primary's filesystem and credentials, so it never hits the
+  # expired-seeded-login failure this exists for (docs/podman-backend.md
+  # "Known issue: worker boots with expired login").
+  echo "launch=$LAUNCH" >> "$STATE/$ID.meta"
+fi
 if [ "$KIND" = secondmate ]; then
   sq_home=$(shell_quote "$PROJ_ABS")
   LAUNCH="FM_ROOT_OVERRIDE= FM_STATE_OVERRIDE= FM_DATA_OVERRIDE= FM_PROJECTS_OVERRIDE= FM_CONFIG_OVERRIDE= FM_HOME=$sq_home $LAUNCH"

@@ -80,6 +80,56 @@ Profile-specific mount/network posture on top of that shared set:
 | dev | read-write (image default) | `rw` at `/work` | default bridge (registries, `gh`, etc.) | n/a |
 | scout | `--read-only` | `ro` at `/work` | `--network=none` | `/work/.fm-scratch` tmpfs, 512m, `rw` |
 
+## Credential seeding
+
+A podman crewmate has no access to the primary's filesystem, so
+`fm_backend_podman_seed_credentials` copies the primary's own `~/.claude` (and
+`~/.claude.json`) into the container at create time with `podman cp`, which
+streams from the calling process's filesystem view rather than the podman
+daemon's. A copy, not a bind mount, so each crewmate's own Claude Code writes
+land in a throwaway copy instead of racing the primary's real credential file.
+
+The copy is verified, not best-effort: after copying, the container's
+`.credentials.json` must be byte-identical in size to the primary's current
+file, retried a few times (`FM_BACKEND_PODMAN_SEED_RETRIES`, default 3) to ride
+out a concurrent credential refresh. A copy that cannot be verified removes the
+container and fails the spawn. Absent host credentials are not an error - the
+primary may authenticate by API key, or the task may run a non-claude harness -
+but they do print a warning.
+
+### Known issue: worker boots with expired login
+
+**Symptom**: a freshly spawned podman worker does no work at all. Its pane sits
+at `Login expired · Run /login`, the spinner runs for about a second and stops,
+and no further progress ever appears. Firstmate sees a live container and a
+live pane, so nothing looks wrong from the outside.
+
+**Root cause**: the seeded `~/.claude/.credentials.json` is stale, truncated, or
+missing. The agent caches the bad token at startup and never authenticates.
+Before this was fixed, the seeding `podman cp` ended in `|| true`, so a failed
+copy - or one that captured a partial file mid credential refresh - was
+completely silent (observed 2026-08-03: a container held a stale 276-byte
+credential file while the primary's valid one was 504 bytes). Seeding now
+verifies the copy and fails the spawn loudly instead.
+
+**Recovery**, in order of preference:
+
+1. Re-seed the live container: `bin/fm-podman-reseed.sh <id> --restart`. This
+   copies the primary's CURRENT credentials into the running container and
+   restarts its agent using the launch command recorded at spawn (meta
+   `launch=`), keeping the worktree. Drop `--restart` to re-seed only.
+2. Otherwise `bin/fm-teardown.sh <id> --force` and respawn: a fresh spawn
+   re-seeds the current credentials. `--force` is required because the frozen
+   worker has no landed work; only use it once you have confirmed there is no
+   unlanded work to lose.
+
+Do NOT hand-copy the credential file: firstmate's own classifier blocks a
+direct `podman cp` of a credential file, so only a captain's `!`-prefixed shell
+command can do it, and it bypasses the verification above.
+
+If a spawn itself fails with a credential-seeding error, the primary's own
+login is the problem - re-authenticate the primary, then spawn again.
+
 ## Open questions (flagged for captain confirmation)
 
 - **Worktree acquisition scope**: `fm-spawn.sh` sends `treehouse get` into

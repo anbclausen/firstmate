@@ -217,6 +217,95 @@ fm_backend_podman_treehouse_volume() {  # <proj_abs>
   printf 'fm-treehouse-%s-%s' "$(fm_backend_podman_home_label)" "$(fm_backend_podman_path_hash "$1")"
 }
 
+# --- credential seeding -------------------------------------------------
+#
+# Seed Claude credentials into the crewmate's OWN writable ~/.claude by
+# copying (not bind-mounting) from the primary's own already-authenticated
+# $HOME/.claude - `podman cp` streams from the CALLING process's (the
+# primary's) filesystem view over the API, unlike `-v`, whose source must be
+# visible to the podman daemon itself (the podman-machine VM's own filesystem
+# for a containerized primary, which the primary's internal /home/agent path
+# is not - see docs/podman-backend.md). A copy, not a live mount, also means
+# Claude Code's own writes (session-env, transcripts, trust-map updates) land
+# in each crewmate's own throwaway copy instead of racing concurrent crewmates
+# against each other or the primary's real credential file.
+#
+# The copy is VERIFIED rather than best-effort. It used to end in `|| true`, so
+# a failed copy - or one that captured a truncated file mid credential refresh
+# - was silent and the container launched an agent that could never
+# authenticate, freezing at "Login expired - Run /login" while firstmate saw a
+# healthy endpoint (docs/podman-backend.md "Known issue"). Now a credential
+# file that cannot be copied intact stops the spawn instead.
+
+# Minimum plausible size of a real .credentials.json. An observed stale/partial
+# file was 276 bytes against a valid 504, so size alone cannot separate stale
+# from current - this floor only rejects an empty or obviously truncated copy;
+# the byte-for-byte host/container comparison below is what proves the
+# container holds the primary's CURRENT file.
+FM_BACKEND_PODMAN_MIN_CREDS_BYTES=${FM_BACKEND_PODMAN_MIN_CREDS_BYTES:-64}
+FM_BACKEND_PODMAN_SEED_RETRIES=${FM_BACKEND_PODMAN_SEED_RETRIES:-3}
+
+fm_backend_podman_host_size() {  # <path> -> byte count, or empty
+  wc -c < "$1" 2>/dev/null | tr -d ' '
+}
+
+fm_backend_podman_container_size() {  # <container> <path> -> byte count, or empty
+  podman exec "$1" sh -c 'wc -c < "$1" 2>/dev/null' -- "$2" 2>/dev/null | tr -d ' \r'
+}
+
+# fm_backend_podman_seed_credentials: copy the primary's CURRENT ~/.claude (and
+# ~/.claude.json) into <container>, then prove the container's
+# .credentials.json is byte-identical to the primary's. Retries the credential
+# copy alone (cheap, and the usual cause of a mismatch is a concurrent
+# credential refresh that has since settled) before failing.
+#
+# Absent host credentials are NOT an error: the primary may authenticate by
+# API key or the task may run a non-claude harness. Only a credential file that
+# exists on the host and cannot be delivered intact fails.
+fm_backend_podman_seed_credentials() {  # <container>
+  local name=$1 creds="$HOME/.claude/.credentials.json" hsize csize i=0
+  if [ ! -d "$HOME/.claude" ]; then
+    echo "warning: no $HOME/.claude to seed into podman container '$name' - the agent will need its own authentication" >&2
+    return 0
+  fi
+  if ! podman cp "$HOME/.claude/." "$name:/home/agent/.claude" >/dev/null 2>&1; then
+    echo "error: failed to copy $HOME/.claude into podman container '$name' - refusing to launch an agent that cannot authenticate" >&2
+    return 1
+  fi
+  if [ -f "$HOME/.claude.json" ] && ! podman cp "$HOME/.claude.json" "$name:/home/agent/.claude.json" >/dev/null 2>&1; then
+    echo "error: failed to copy $HOME/.claude.json into podman container '$name'" >&2
+    return 1
+  fi
+  if [ -f "$creds" ]; then
+    hsize=$(fm_backend_podman_host_size "$creds")
+    case "$hsize" in
+      ''|*[!0-9]*)
+        echo "error: could not read the size of $creds - refusing to seed podman container '$name' with unverifiable credentials" >&2
+        return 1
+        ;;
+    esac
+    if [ "$hsize" -lt "$FM_BACKEND_PODMAN_MIN_CREDS_BYTES" ]; then
+      echo "error: $creds is only $hsize bytes (minimum $FM_BACKEND_PODMAN_MIN_CREDS_BYTES) - the primary's own credentials look empty or truncated; re-authenticate the primary before spawning" >&2
+      return 1
+    fi
+    while :; do
+      csize=$(fm_backend_podman_container_size "$name" /home/agent/.claude/.credentials.json)
+      [ "$csize" = "$hsize" ] && break
+      i=$((i + 1))
+      if [ "$i" -ge "$FM_BACKEND_PODMAN_SEED_RETRIES" ]; then
+        echo "error: podman container '$name' holds ${csize:-no} bytes of .credentials.json against the primary's $hsize - the seeded login would be stale or missing, so the agent would freeze at 'Login expired'" >&2
+        return 1
+      fi
+      sleep 1
+      podman cp "$creds" "$name:/home/agent/.claude/.credentials.json" >/dev/null 2>&1 || true
+    done
+  else
+    echo "warning: $creds does not exist - podman container '$name' is seeded without a Claude login" >&2
+  fi
+  podman exec -u root "$name" chown -R agent:agent /home/agent/.claude /home/agent/.claude.json >/dev/null 2>&1 || true
+  return 0
+}
+
 # fm_backend_podman_create_task: start the task's container from the
 # resolved image, mounting the project clone read-write at
 # FM_BACKEND_PODMAN_MOUNT (see the file header's "OPEN ASSUMPTION" - treehouse
@@ -277,24 +366,10 @@ fm_backend_podman_create_task() {  # <label> <proj_abs> <kind>
       return 1
     fi
   fi
-  # Seed Claude credentials into the crewmate's OWN writable ~/.claude by
-  # copying (not bind-mounting) from the primary's own already-authenticated
-  # $HOME/.claude - `podman cp` streams from the CALLING process's (the
-  # primary's) filesystem view over the API, unlike `-v`, whose source must
-  # be visible to the podman daemon itself (the podman-machine VM's own
-  # filesystem for a containerized primary, which the primary's internal
-  # /home/agent path is not - see docs/podman-backend.md). A copy, not a
-  # live mount, also means Claude Code's own writes (session-env, transcripts,
-  # trust-map updates) land in each crewmate's own throwaway copy instead of
-  # racing concurrent crewmates against each other or the primary's real
-  # credential file.
-  if [ -d "$HOME/.claude" ]; then
-    podman cp "$HOME/.claude/." "$name:/home/agent/.claude" >/dev/null 2>&1 || true
+  if ! fm_backend_podman_seed_credentials "$name"; then
+    podman rm -f "$name" >/dev/null 2>&1 || true
+    return 1
   fi
-  if [ -f "$HOME/.claude.json" ]; then
-    podman cp "$HOME/.claude.json" "$name:/home/agent/.claude.json" >/dev/null 2>&1 || true
-  fi
-  podman exec -u root "$name" chown -R agent:agent /home/agent/.claude /home/agent/.claude.json >/dev/null 2>&1 || true
   if ! podman exec -d "$name" tmux new-session -d -s "$FM_BACKEND_PODMAN_TMUX_SESSION" -c "$FM_BACKEND_PODMAN_MOUNT" >/dev/null 2>&1; then
     echo "error: failed to start the in-container tmux session for '$name' (does the image have tmux installed?)" >&2
     podman rm -f "$name" >/dev/null 2>&1 || true

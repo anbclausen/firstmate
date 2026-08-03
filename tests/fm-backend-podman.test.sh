@@ -55,7 +55,15 @@ case "${1:-}" in
     exit 0
     ;;
   exec)
+    for a in "$@"; do
+      case "$a" in
+        *"wc -c"*) printf '%s\n' "${FM_PODMAN_FAKE_CRED_SIZE:-}" ;;
+      esac
+    done
     exit "${FM_PODMAN_FAKE_EXEC_EXIT:-0}"
+    ;;
+  cp)
+    exit "${FM_PODMAN_FAKE_CP_EXIT:-0}"
     ;;
   run|build|stop|rm)
     exit "${FM_PODMAN_FAKE_RUN_EXIT:-0}"
@@ -229,5 +237,55 @@ img=$(fm_backend_podman_image_for "$proj" scout 2>/dev/null) \
 [ "$img" = "$(fm_backend_podman_standard_image_tag scout)" ] \
   || fail "image_for scout should return the standard scout tag, got: $img"
 pass "image_for still uses the standard scout profile when a project has no Containerfile"
+
+# --- credential seeding is verified, never silently best-effort ---------------
+#
+# A silent seeding failure launched a worker frozen at "Login expired" that
+# firstmate could not tell from a healthy one (docs/podman-backend.md
+# "Known issue: worker boots with expired login").
+
+FAKE_HOME="$DIR/fake-home"
+mkdir -p "$FAKE_HOME/.claude"
+# 300 bytes: comfortably over FM_BACKEND_PODMAN_MIN_CREDS_BYTES.
+awk 'BEGIN{while(i++<300) printf "x"}' > "$FAKE_HOME/.claude/.credentials.json"
+HOST_CRED_SIZE=$(wc -c < "$FAKE_HOME/.claude/.credentials.json" | tr -d ' ')
+HOME="$FAKE_HOME"
+export HOME
+
+FM_PODMAN_FAKE_CRED_SIZE="$HOST_CRED_SIZE" fm_backend_podman_seed_credentials fm-c 2>/dev/null \
+  || fail "seeding should succeed when the container's credential copy matches the primary's"
+pass "credential seeding accepts a copy matching the primary's current file"
+
+export FM_BACKEND_PODMAN_SEED_RETRIES=1
+if err=$(FM_PODMAN_FAKE_CRED_SIZE=276 fm_backend_podman_seed_credentials fm-c 2>&1); then
+  fail "seeding must fail when the container's credential copy does not match the primary's"
+fi
+case "$err" in
+  *"Login expired"*) : ;;
+  *) fail "seeding failure must name the frozen-login consequence; got: $err" ;;
+esac
+pass "credential seeding fails loudly on a stale or short credential copy"
+
+if err=$(FM_PODMAN_FAKE_CP_EXIT=1 fm_backend_podman_seed_credentials fm-c 2>&1); then
+  fail "seeding must fail when the podman cp itself fails"
+fi
+case "$err" in
+  *"cannot authenticate"*) : ;;
+  *) fail "a failed credential copy must refuse to launch; got: $err" ;;
+esac
+pass "credential seeding fails loudly when the copy itself fails"
+unset FM_BACKEND_PODMAN_SEED_RETRIES
+
+# An empty or truncated credential file on the PRIMARY is the primary's own
+# problem and must stop the spawn rather than seed an unusable login.
+printf 'x' > "$FAKE_HOME/.claude/.credentials.json"
+if err=$(FM_PODMAN_FAKE_CRED_SIZE=1 fm_backend_podman_seed_credentials fm-c 2>&1); then
+  fail "seeding must refuse a truncated credential file on the primary"
+fi
+case "$err" in
+  *"truncated"*) : ;;
+  *) fail "a truncated primary credential file must be named as such; got: $err" ;;
+esac
+pass "credential seeding refuses a truncated credential file on the primary"
 
 echo "all fm-backend-podman.test.sh checks passed"

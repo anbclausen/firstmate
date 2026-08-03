@@ -9,15 +9,14 @@ use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, Borders, Gauge, Paragraph};
 use ratatui::Frame;
 
-const SHIP_ART: &str = r#"
-        |    |    |
-       )_)  )_)  )_)
-      )___))___))___)\
-     )____)____)_____)\\
-   _____|____|____|____\\\__
-   \                   /
-    \_________________/
-"#;
+use crate::head::{figurehead_frame, HeadState};
+
+/// The figurehead's own ship, so first launch and the running TUI show one
+/// vessel rather than two drawings that drift apart. A single frame: nothing
+/// is under way yet to animate.
+fn ship_art() -> String {
+    figurehead_frame(HeadState::Sailing, 0).join("\n")
+}
 
 pub struct LoadingScreen {
     pub label: String,
@@ -42,7 +41,7 @@ impl LoadingScreen {
             ])
             .split(area);
 
-        let ship = Paragraph::new(Text::from(SHIP_ART))
+        let ship = Paragraph::new(Text::from(ship_art()))
             .alignment(ratatui::layout::Alignment::Center)
             .style(Style::default().fg(Color::Cyan));
         frame.render_widget(ship, chunks[0]);

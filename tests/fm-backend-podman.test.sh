@@ -12,7 +12,8 @@ set -u
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-TMP_ROOT=$(fm_test_tmproot fm-backend-podman-tests)
+# Each test case allocates its own temp root with fm_test_tmproot; this suite
+# keeps no shared one.
 
 # make_podman_fakebin: a `podman` stub that logs every invocation (one line,
 # unit-separated args, to $FM_PODMAN_LOG) and answers a handful of

@@ -251,6 +251,20 @@ mod tests {
         assert!(!head.settle(Duration::ZERO, false), "idling is already settled");
     }
 
+    /// The notification ping hangs off this transition, so a session left
+    /// idling has to keep reporting no change however long it sits there.
+    #[test]
+    fn settling_reports_the_transition_once_per_lull() {
+        let mut head = Head::new();
+        head.set_state(HeadState::Talking);
+        assert!(head.settle(Duration::ZERO, false), "the lull begins");
+        for _ in 0..5 {
+            assert!(!head.settle(Duration::ZERO, false), "already idling");
+        }
+        head.set_state(HeadState::Talking);
+        assert!(head.settle(Duration::ZERO, false), "a fresh lull reports again");
+    }
+
     /// A decision box is a live blocked state, so the quiet timer must not
     /// flip the figurehead to idling while the captain is being asked.
     #[test]

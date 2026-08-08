@@ -44,11 +44,14 @@ pub fn encode(key: KeyEvent, modes: Modes) -> Option<Vec<u8>> {
                 c.to_string().into_bytes()
             }
         }
-        // Shift+Enter is the harnesses' "newline, don't submit" chord, so it
-        // has to send a bare line feed; a carriage return is what submits.
-        // This only reaches us at all because `main.rs` asks the terminal for
-        // the keyboard enhancements that tell the two apart.
-        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => vec![b'\n'],
+        // Shift+Enter is the harnesses' "newline, don't submit" chord; a
+        // carriage return is what submits. This only reaches us at all
+        // because `main.rs` asks the terminal for the keyboard enhancements
+        // that tell the two apart, and it has to leave in the same form it
+        // arrived in rather than as a bare line feed.
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            modified_enter(key.modifiers)
+        }
         KeyCode::Enter => vec![b'\r'],
         KeyCode::Tab => vec![b'\t'],
         KeyCode::BackTab => b"\x1b[Z".to_vec(),
@@ -104,6 +107,19 @@ fn cursor_key(final_byte: u8, modifiers: KeyModifiers, modes: Modes) -> Vec<u8> 
         Some(param) => format!("\x1b[1;{param}{}", final_byte as char).into_bytes(),
         None if modes.application_cursor => vec![0x1b, b'O', final_byte],
         None => vec![0x1b, b'[', final_byte],
+    }
+}
+
+/// Enter with a modifier held. The chord has no legacy byte of its own, so it
+/// travels as the `CSI 13 ; <modifier> u` form the keyboard protocol defines
+/// for it, 13 being the carriage return a plain Enter sends. A bare line feed
+/// will not do: a harness reading a raw terminal takes that for Ctrl+J, which
+/// is a different chord that only happens to mean newline in some of them.
+/// Unmodified there is nothing to disambiguate, so the plain byte stands.
+fn modified_enter(modifiers: KeyModifiers) -> Vec<u8> {
+    match modifier_param(modifiers) {
+        Some(param) => format!("\x1b[13;{param}u").into_bytes(),
+        None => vec![b'\r'],
     }
 }
 
@@ -199,12 +215,31 @@ mod tests {
     }
 
     /// Shift+Enter must open a new line in the harness's input, not submit it,
-    /// which is what a carriage return does.
+    /// which is what a carriage return does. The captain's blocker: it was
+    /// sent as a bare line feed, which a harness reading a raw terminal takes
+    /// for Ctrl+J rather than for a modified Enter.
     #[test]
-    fn shift_enter_sends_a_newline_rather_than_submitting() {
+    fn shift_enter_sends_the_modified_enter_escape_rather_than_submitting() {
         assert_eq!(
             encoded(chord(KeyCode::Enter, KeyModifiers::SHIFT)),
-            vec![0x0a]
+            b"\x1b[13;2u".to_vec()
+        );
+    }
+
+    /// The escape carries whatever else is held in the same modifier
+    /// parameter the arrows use, and already being an escape sequence it must
+    /// not pick up a second ESC prefix from alt.
+    #[test]
+    fn a_further_modified_shift_enter_carries_its_modifier_parameter() {
+        let ctrl_shift = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        assert_eq!(
+            encoded(chord(KeyCode::Enter, ctrl_shift)),
+            b"\x1b[13;6u".to_vec()
+        );
+        let alt_shift = KeyModifiers::ALT | KeyModifiers::SHIFT;
+        assert_eq!(
+            encoded(chord(KeyCode::Enter, alt_shift)),
+            b"\x1b[13;4u".to_vec()
         );
     }
 

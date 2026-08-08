@@ -48,6 +48,11 @@ const SCROLLBACK: usize = 1000;
 /// claiming the harness is still talking or thinking.
 const HEAD_QUIET: Duration = Duration::from_millis(600);
 
+/// How long after a keystroke the harness's output is still that keystroke
+/// coming back rather than work of its own. Generous, because a session that
+/// really is working writes again a frame later and gets under way then.
+const HEAD_ECHO: Duration = Duration::from_millis(250);
+
 fn repo_root() -> PathBuf {
     // This binary lives at <repo>/tui; walk up from the crate manifest dir
     // at compile time so it works regardless of the process's cwd.
@@ -197,7 +202,7 @@ impl App {
         for event in events {
             match event {
                 ChildEvent::Output(bytes) => {
-                    self.head.set_state(HeadState::Sailing);
+                    self.head.saw_output(HEAD_ECHO);
                     self.parser.process(&bytes);
                 }
                 ChildEvent::Decision(decision) => {
@@ -626,12 +631,6 @@ fn compute_layout(area: Rect) -> Areas {
     }
 }
 
-/// The agent pane rect. Shared by drawing and by the resize path so the pty is
-/// always sized to the pane that is actually rendered.
-fn pane_rect(area: Rect) -> Rect {
-    compute_layout(area).pane
-}
-
 fn draw(frame: &mut ratatui::Frame, app: &App) {
     match &app.mode {
         Mode::ChooseHarness { selected } => draw_choose_harness(frame, *selected),
@@ -1019,7 +1018,7 @@ mod tests {
     #[test]
     fn sync_size_matches_the_emulator_to_the_pane_inside_its_border() {
         let mut app = running_app();
-        let pane = pane_rect(Rect::new(0, 0, 100, 40));
+        let pane = compute_layout(Rect::new(0, 0, 100, 40)).pane;
 
         app.sync_size(Rect::new(0, 0, 100, 40));
 
@@ -1063,7 +1062,7 @@ mod tests {
             "escape bytes leaked into the rendered screen"
         );
 
-        let pane = pane_rect(screen);
+        let pane = compute_layout(screen).pane;
         let inner = Block::default().borders(Borders::ALL).inner(pane);
         let cell = &buffer[(inner.x + 4, inner.y + 2)];
         assert_eq!(cell.symbol(), "a", "cursor addressing was not honoured");
@@ -1284,6 +1283,29 @@ mod tests {
         assert_eq!(app.head.settle(Duration::ZERO, false), Settled::YourTurn);
 
         app.kill_child();
+    }
+
+    /// The other half of the same echo. Those keystrokes coming back also
+    /// looked exactly like the harness producing, which put an idle session
+    /// under full sail while the captain was only composing.
+    #[test]
+    fn the_captains_own_typing_never_puts_the_ship_under_sail() {
+        let mut app = running_app();
+        app.child = Some(child::spawn("cat", &[], None, 24, 80).unwrap());
+
+        for c in "ahoy".chars() {
+            handle_running_key(&mut app, key(KeyCode::Char(c)));
+        }
+        // What the harness writes on the heels of those keystrokes is those
+        // same keystrokes.
+        app.head.saw_output(HEAD_ECHO);
+        let rendered = render_to_string(&app, 100, 40);
+        app.kill_child();
+
+        assert!(
+            rendered.contains("idling") && !rendered.contains("sailing"),
+            "expected the ship still at anchor, got {rendered:?}"
+        );
     }
 
     /// Shift+Enter opens a new line in the harness's input rather than

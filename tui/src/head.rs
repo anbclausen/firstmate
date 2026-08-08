@@ -137,7 +137,9 @@ pub fn figurehead_frame(state: HeadState, tick: usize) -> Vec<String> {
 /// The harness echoes the captain's own keystrokes back down the pty, so
 /// output alone cannot tell work apart from an echo of what the captain just
 /// typed. The turn can: it is the harness's only from the moment the captain
-/// submits until the session comes to rest again.
+/// submits until the session comes to rest again, which is what makes the lull
+/// at the end of it worth ringing at them. `Head::saw_output` answers the
+/// narrower question of whether one piece of output was that echo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Turn {
     Captain,
@@ -163,6 +165,9 @@ pub struct Head {
     /// actually did; `settle` reads it to fall back to idling.
     since: Instant,
     turn: Turn,
+    /// When the captain last sent a keystroke, so output arriving on its
+    /// heels can be read as the harness echoing it back rather than working.
+    last_key: Option<Instant>,
 }
 
 impl Head {
@@ -174,6 +179,7 @@ impl Head {
             // Nothing has been asked of the harness yet, so the first lull is
             // the captain's own, not a turn coming back to them.
             turn: Turn::Captain,
+            last_key: None,
         }
     }
 
@@ -182,12 +188,29 @@ impl Head {
     /// is them pausing mid-sentence rather than the session handing back.
     pub fn captain_typed(&mut self) {
         self.turn = Turn::Captain;
+        self.last_key = Some(Instant::now());
     }
 
     /// The captain submitted: from here the output is the harness's own work,
     /// and the lull at the end of it is the real "your turn, captain".
     pub fn captain_submitted(&mut self) {
         self.turn = Turn::Harness;
+        self.last_key = Some(Instant::now());
+    }
+
+    /// The harness wrote something. That alone is not proof of work: it
+    /// echoes the captain's keystrokes straight back down the pty, so output
+    /// landing within `echo` of one is their own typing coming back. Such an
+    /// echo may keep a ship that is already under way moving - the captain
+    /// composing while the harness works must not becalm her - but it may
+    /// never get one under way, which is what put an idle session under full
+    /// sail while the captain was still writing.
+    pub fn saw_output(&mut self, echo: Duration) {
+        let echoed = self.last_key.is_some_and(|key| key.elapsed() < echo);
+        if echoed && self.state != HeadState::Sailing {
+            return;
+        }
+        self.set_state(HeadState::Sailing);
     }
 
     pub fn set_state(&mut self, state: HeadState) {
@@ -434,6 +457,54 @@ mod tests {
         head.captain_typed();
         head.set_state(HeadState::Sailing);
         assert_eq!(head.settle(Duration::ZERO, false), Settled::Quiet);
+    }
+
+    /// The bug: the harness echoes the captain's keystrokes straight back, so
+    /// composing at an idle session drove the ship under full sail as if a
+    /// turn were under way.
+    #[test]
+    fn an_echo_of_the_captains_typing_leaves_the_ship_at_anchor() {
+        let mut head = Head::new();
+        head.captain_typed();
+        head.saw_output(Duration::from_secs(60));
+        assert_eq!(head.state, HeadState::Idle);
+    }
+
+    /// Only the echo is held back. A session that really is working writes
+    /// again once the echo has passed, and that gets her under way.
+    #[test]
+    fn output_that_is_not_an_echo_gets_the_ship_under_way() {
+        let mut head = Head::new();
+        head.captain_typed();
+        head.saw_output(Duration::ZERO);
+        assert_eq!(head.state, HeadState::Sailing);
+    }
+
+    /// The harness's own launch output arrives before the captain has typed
+    /// anything at all, so there is nothing for it to be an echo of.
+    #[test]
+    fn output_before_the_captain_has_typed_is_work() {
+        let mut head = Head::new();
+        head.saw_output(Duration::from_secs(60));
+        assert_eq!(head.state, HeadState::Sailing);
+    }
+
+    /// The captain composing a follow-up while the harness works must not
+    /// becalm her: an echo may not get a ship under way, but it must keep the
+    /// quiet timer of one already moving alive.
+    #[test]
+    fn typing_while_the_harness_works_keeps_her_under_way() {
+        let mut head = working();
+        std::thread::sleep(Duration::from_millis(200));
+        head.captain_typed();
+        head.saw_output(Duration::from_secs(60));
+
+        assert_eq!(head.state, HeadState::Sailing);
+        assert_eq!(
+            head.settle(Duration::from_millis(100), false),
+            Settled::Unchanged,
+            "the echo kept her quiet timer alive"
+        );
     }
 
     /// A decision box is a live blocked state, so the quiet timer must not

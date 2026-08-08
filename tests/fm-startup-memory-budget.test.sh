@@ -76,6 +76,11 @@ new_bootstrap_world() {
   root="$world/root"
   home="$world/home"
   mkdir -p "$home/config" "$home/data" "$home/state" "$root/bin"
+  # A fresh home also trips bin/fm-bootstrap.sh's one-time private-context-repo
+  # advisory, which has nothing to do with the budget. Pre-mark it as already
+  # seen so the quiet-default case below measures the budget path alone;
+  # tests/fm-bootstrap.test.sh owns the advisory's own coverage the same way.
+  : > "$home/state/.private-context-nudged"
   git init -q -b main "$root"
   printf '%s\n' 'config/' > "$root/.gitignore"
   printf '%s\n' '# Firstmate test root' > "$root/AGENTS.md"

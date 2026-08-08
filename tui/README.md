@@ -9,7 +9,10 @@ It does not yet wire into firstmate's session-backend machinery (tmux, herdr, ze
 ## Installing and running
 
 Captain-facing setup is the root [`install.sh`](../install.sh) plus the installed `fm` command - see the root [`README.md`](../README.md) "Quick Start".
-Podman is the only host prerequisite; `install.sh` compiles this crate inside `tui/Containerfile`'s build container (no host Rust toolchain needed), and the installed `fm` command itself relaunches into `tui/runtime.Containerfile`'s container before running (`src/container.rs`), so the TUI's real process gets the same podman-socket privileges the firstmate primary itself needs to see sibling crewmate containers.
+Podman is the only host prerequisite; `install.sh` compiles this crate inside `tui/Containerfile`'s build container (no host Rust toolchain needed), and the installed `fm` command itself relaunches into `tui/runtime.Containerfile`'s container before running (the host-side launcher script [`fm`](fm)), so the TUI's real process gets the same podman-socket privileges the firstmate primary itself needs to see sibling crewmate containers.
+
+Only one `fm` session runs against this repo at a time - the launcher spots a live one and asks `An fm session is already running. Kill it and start a new one? [y/N]` before doing anything to it.
+Anything but yes leaves the running session untouched and starts nothing; yes stops it first, and if it survives the launcher reports that and exits rather than starting a second session beside it.
 
 For crate-local development instead:
 

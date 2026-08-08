@@ -236,8 +236,8 @@ fm_backend_detect_cmux_app_is_ancestor() {
   return 1
 }
 
-# fm_backend_name: resolve the ACTIVE backend for a NEW spawn, absent an
-# explicit per-task override. Precedence: FM_BACKEND env, then config/backend
+# fm_backend_name [kind]: resolve the ACTIVE backend for a NEW spawn, absent
+# an explicit per-task override. Precedence: FM_BACKEND env, then config/backend
 # (a single word on its first non-empty line, mirroring config/crew-harness),
 # then runtime auto-detection (fm_backend_detect), then the fallback default.
 # A per-task `--backend` flag is parsed by the caller (fm-spawn.sh) and takes
@@ -257,8 +257,15 @@ fm_backend_detect_cmux_app_is_ancestor() {
 # refuses to run as root). This is a deliberate captain decision for this
 # fork specifically, not a fact about firstmate in general - set
 # config/backend=tmux (or --backend tmux per spawn) to opt back into tmux.
-fm_backend_name() {
-  local line v detected marker
+# That fallback is about CREWMATE containerization, so it does not apply to a
+# `secondmate` kind: podman owns one container per home and refuses
+# --secondmate spawns outright (fm-spawn.sh), so falling back to it would make
+# every unconfigured secondmate launch impossible. A secondmate spawn with
+# nothing explicit and nothing auto-detected therefore falls back to tmux. An
+# explicitly chosen podman still reaches fm-spawn.sh's loud refusal, because an
+# explicit setting always wins.
+fm_backend_name() {  # [kind]
+  local kind=${1:-} line v detected marker
   if [ -n "${FM_BACKEND:-}" ]; then
     printf '%s' "$FM_BACKEND"
     return 0
@@ -288,6 +295,10 @@ fm_backend_name() {
       echo "NOTICE: auto-detected cmux runtime ($marker) - spawning into the EXPERIMENTAL cmux backend. Set config/backend or pass --backend tmux to opt out." >&2
     fi
     printf '%s' "$detected"
+    return 0
+  fi
+  if [ "$kind" = secondmate ]; then
+    printf 'tmux'
     return 0
   fi
   printf 'podman'

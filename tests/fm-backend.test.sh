@@ -155,6 +155,12 @@ test_backend_name_precedence() {
   [ "$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID __CFBundleIdentifier; PATH="$FAKE_NONDARWIN_BIN:$PATH" FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_name)" = podman ] \
     || fail "fm_backend_name should default to podman (this fork's fallback default) with no env/config/detection markers"
 
+  # podman refuses --secondmate spawns, so the podman fallback must not apply
+  # to a secondmate kind: it would make every unconfigured secondmate launch
+  # impossible.
+  [ "$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID __CFBundleIdentifier; PATH="$FAKE_NONDARWIN_BIN:$PATH" FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_name secondmate)" = tmux ] \
+    || fail "fm_backend_name secondmate should fall back to tmux, not the podman crewmate fallback"
+
   printf 'tmux\n' > "$cfg/backend"
   [ "$(unset TMUX HERDR_ENV CMUX_WORKSPACE_ID; FM_BACKEND='' FM_BACKEND_CONFIG_DIR="$cfg" fm_backend_name)" = tmux ] \
     || fail "fm_backend_name should read config/backend"

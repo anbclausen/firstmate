@@ -95,7 +95,7 @@ log_calls() { tr $'\x1f' ' ' < "$FM_PODMAN_LOG" 2>/dev/null; }
 # --- tool_check / container_ensure ------------------------------------------
 
 setup_case
-# shellcheck source=bin/backends/podman.sh
+# shellcheck source=/dev/null
 . "$ROOT/bin/backends/podman.sh"
 
 fm_backend_podman_tool_check || fail "tool_check should pass when podman is on PATH"

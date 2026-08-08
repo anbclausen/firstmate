@@ -716,6 +716,16 @@ families_for_changed_path() {
     tests/*)
       printf '%s\n' "__unmapped__:$path"
       ;;
+    tui/fm)
+      # The host-side launcher is shell, so its behavior test lives in this
+      # suite; the reference fallback below resolves it.
+      families_for_test_reference "$path" \
+        || printf '%s\n' "__unmapped__:$path"
+      ;;
+    tui/*)
+      # The Rust crate and its own docs. .github/workflows/ci.yml's
+      # "TUI crate tests" job owns that coverage, not this shell suite.
+      ;;
     README.md|LICENSE|assets/*|docs/*|.gitignore)
       ;;
     *)

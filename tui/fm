@@ -54,16 +54,39 @@ elif ! podman image exists "$RUNTIME_IMAGE"; then
     -f "$FM_REPO_ROOT/tui/runtime.Containerfile" "$FM_REPO_ROOT"
 fi
 
-# A running container means another session is live - refuse rather than kill
-# it out from under that session. A stopped/stale one is safe to replace.
-if podman ps --filter "name=^${CONTAINER_NAME}$" --filter status=running \
-     --format '{{.Names}}' | grep -q .; then
-  echo "fm: a firstmate TUI container (\"$CONTAINER_NAME\") is already running;" >&2
-  echo "    refusing to take over another active session. Stop it first with" >&2
-  echo "    'podman rm -f $CONTAINER_NAME' if it is actually stale." >&2
+# A running container is the only signal of a live fm session the host can
+# read: firstmate's per-home session lock (bin/fm-lock.sh) records a harness
+# pid from inside the container's pid namespace, so its liveness test is
+# meaningless out here. Killing that session is the captain's call, so ask.
+session_running() {
+  podman ps --filter "name=^${CONTAINER_NAME}$" --filter status=running \
+    --format '{{.Names}}' | grep -q .
+}
+
+if session_running; then
+  reply=
+  printf 'fm: an fm session is already running. Kill it and start a new one? [y/N] '
+  # Nothing to read means nobody is there to approve: default to leaving the
+  # running session alone, and close the prompt line the captain never saw.
+  read -r reply || { reply=; echo; }
+  case "$reply" in
+    y|Y|yes|Yes|YES) ;;
+    *)
+      echo "fm: leaving the running session in place; not starting a second one." >&2
+      exit 1
+      ;;
+  esac
+fi
+
+# Clears the killed session's container, or a stopped/stale one of the same
+# name. Two live sessions on one home would race for the session lock, so a
+# container that survives the kill stops the launch instead of joining it.
+podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+if session_running; then
+  echo "fm: could not stop the running session (\"$CONTAINER_NAME\"); refusing to" >&2
+  echo "    start a second one. Try 'podman rm -f $CONTAINER_NAME'." >&2
   exit 1
 fi
-podman rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 
 # Resolve the daemon's own socket path (valid inside the VM or on native
 # Linux); without this mount the container can't see sibling crewmate

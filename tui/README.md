@@ -52,7 +52,7 @@ The screen is the agent pane framed by lightweight status regions; the pane is t
   The `podman ps` read runs on a background thread and refreshes on a timer, so it never blocks the UI or forks podman per frame.
 - Bottom: a one-line status bar which always shows who owns the keyboard and how to quit.
   The wrapped harness already shows its own model and context readouts inside the pane, so the bar does not repeat them.
-- A task detail overlay, popped over the TUI while the captain walks the backlog (see below), and a decision box, rendered as a popup overlay on top of the agent pane whenever the wrapped harness emits a decision (see below).
+- A task detail overlay, popped over the TUI while the captain walks the backlog (see below); a live look-in on a crewmate's own session, popped over the agent pane while they walk the crew (see below); and a decision box, rendered as a popup overlay on top of the agent pane whenever the wrapped harness emits a decision (see below).
 
 The tasks pane, the agent pane, and the right-hand column all start at the very top of the screen and run its full height, with only the status line below them.
 On a terminal too narrow to seat both columns and a usable pane, they collapse and the pane spans the whole width, so a small window stays usable rather than corrupting the layout.
@@ -70,12 +70,35 @@ That leaves no ordinary key free to quit on, so the TUI reserves exactly one cho
   Walking the tasks pane pops the selected task's full description - the whole bullet plus its body lines - over the TUI, since the pane can only show a clipped title.
   It comes back down as soon as the captain picks a crewmate, leaves command mode, or a decision box arrives, and it never comes up at all on a terminal too narrow to seat the tasks pane or once the backlog no longer has the selected task.
   The overlay is a fixed size, so an item too long to fit is titled `task - truncated` rather than being cut off silently.
+  Walking the crew pops the matching overlay for a crewmate: a live look-in on that crewmate's own session (see below).
+  Each sidebar's overlay takes the other's down, so only one is ever up.
+- `Ctrl+B` then `Enter` on a picked crewmate attaches to that crewmate's session, which then owns the agent pane and the keyboard.
+- `Ctrl+B` then `f` returns to firstmate's own session from anywhere - an attached crewmate, a look-in, a backlog overlay - and takes every overlay down on the way.
 - `Ctrl+B` then `Ctrl+B` sends a literal `Ctrl+B` on to the harness.
 - `Ctrl+B` then `Esc` leaves command mode and takes any overlay it raised back down; any other key also returns to the terminal without doing anything.
+  `Esc` leaves an attached crewmate in the pane, because that is the session the captain asked for; `Ctrl+B` `f` is what comes back from it.
 - Once the harness has exited there is nothing left to type into, so plain `q`, `Esc`, and `Ctrl+C` quit directly.
+  An attached crewmate's session is still something to type into, so those keys stay the crewmate's until the captain returns to firstmate.
 
 `src/keys.rs` owns the key-to-bytes translation, including the control bytes, the arrow and function-key escape sequences, and the DECCKM (application cursor keys) variants a full-screen harness switches on.
 `Shift+Enter` sends a bare line feed so it opens a new line in the harness's input instead of submitting it; that needs the terminal to tell the two apart, so the TUI asks for the disambiguating keyboard protocol on startup where the terminal supports it.
+
+## Looking in on the crew, and attaching
+
+Each crewmate container runs its harness inside a tmux session created by [`bin/backends/podman.sh`](../bin/backends/podman.sh), which owns that session's name; `src/crew.rs` reads the same `FM_BACKEND_PODMAN_TMUX_SESSION` override so a fleet that renamed it stays reachable from here.
+Both the look-in and attaching are a `podman exec` into that container joining that session, run on a pty of their own by `src/child.rs`, so each is a real terminal rather than a rendered transcript.
+
+The look-in is a read-only tmux client, so no keystroke can reach a crewmate's harness through it.
+It also asks tmux not to let its size count, because the popup is far smaller than the pane and a client that counted would reflow the crewmate's own screen down to the size of the captain's peek.
+That flag is tmux 3.2 and newer; a container carrying an older tmux falls back to a plain read-only client rather than failing to attach at all.
+Attaching is an ordinary read-write client, so there the crewmate's session does follow the agent pane's size, as attaching to a tmux session normally does.
+
+Firstmate's own session keeps its own child process and its own emulator throughout.
+Attaching to a crewmate never tears it down, which is what makes `Ctrl+B` `f` an instant return with its scrollback intact.
+Leaving a crewmate ends only that client, and a tmux client leaving is a detach, so the crewmate's own session and harness run on.
+A crewmate's session ending under the captain - they typed tmux's own detach chord, or the container went away - puts them back at firstmate with a note saying whose session closed.
+
+A decision sentinel scrolling past inside a crewmate's session is ordinary output here, never a decision box: a crewmate's decisions are answered by the firstmate running that crewmate, not from this pane.
 
 ## The decision protocol
 

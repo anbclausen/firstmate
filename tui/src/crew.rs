@@ -56,6 +56,9 @@ impl Health {
 pub struct Crewmate {
     /// The `firstmate.task` label value (or the container name as a fallback).
     pub task: String,
+    /// The container's own name, which is what `podman exec` addresses; the
+    /// task label is a display name and is not always the container's.
+    pub name: String,
     pub health: Health,
     /// podman's human status string, e.g. `Up 3 minutes`.
     pub status: String,
@@ -130,21 +133,84 @@ pub fn parse_ps(json: &str) -> Result<Vec<Crewmate>, String> {
         .map(|entry| {
             let state = entry.state.unwrap_or_default();
             let status = entry.status.unwrap_or_default();
+            let name = entry
+                .names
+                .as_ref()
+                .and_then(|names| names.first().cloned())
+                .unwrap_or_default();
             let task = entry
                 .labels
                 .as_ref()
                 .and_then(|labels| labels.get("firstmate.task"))
                 .map(|task| task.trim().to_string())
                 .filter(|task| !task.is_empty())
-                .or_else(|| entry.names.as_ref().and_then(|names| names.first().cloned()))
-                .unwrap_or_default();
+                .unwrap_or_else(|| name.clone());
             Crewmate {
                 health: classify(state.trim(), status.trim()),
                 task,
+                name,
                 status: status.trim().to_string(),
             }
         })
         .collect())
+}
+
+/// Why the TUI is joining a crewmate's session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Join {
+    /// Watching over the crewmate's shoulder: the client is read-only, so a
+    /// stray keystroke can never reach a crewmate's harness.
+    Preview,
+    /// The captain taking the keyboard, which is an ordinary tmux client.
+    Attach,
+}
+
+/// The tmux session each crewmate container runs its harness in.
+///
+/// `bin/backends/podman.sh` creates it and owns the name; reading the same
+/// environment variable it does is what keeps a fleet that renamed the session
+/// reachable from here.
+fn tmux_session() -> String {
+    std::env::var("FM_BACKEND_PODMAN_TMUX_SESSION")
+        .ok()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "work".to_string())
+}
+
+/// The command that joins `container`'s crewmate session, to be run on a pty of
+/// its own by `child::spawn`.
+///
+/// A preview client also asks tmux not to let its size count, because the
+/// popup is far smaller than the pane and a client that counts would reflow
+/// the crewmate's own screen down to the size of the captain's peek. That flag
+/// is tmux 3.2 and newer, so a container carrying an older tmux falls back to
+/// an ordinary read-only client rather than failing to attach at all. The
+/// session name is passed as an argument rather than interpolated, so a name
+/// carrying shell metacharacters stays one word.
+pub fn session_command(container: &str, join: Join) -> (String, Vec<String>) {
+    let session = tmux_session();
+    let mut args: Vec<String> = ["exec", "-it", container]
+        .iter()
+        .map(|a| a.to_string())
+        .collect();
+    match join {
+        Join::Preview => args.extend([
+            "sh".to_string(),
+            "-c".to_string(),
+            "tmux attach -r -f ignore-size -t \"$1\" 2>/dev/null || exec tmux attach -r -t \"$1\""
+                .to_string(),
+            "fm-tui".to_string(),
+            session,
+        ]),
+        Join::Attach => args.extend([
+            "tmux".to_string(),
+            "attach".to_string(),
+            "-t".to_string(),
+            session,
+        ]),
+    }
+    ("podman".to_string(), args)
 }
 
 /// One `podman ps` read. Errors (podman missing, machine down) come back as a
@@ -353,6 +419,10 @@ mod tests {
         let crew = parse_ps(PS_JSON).unwrap();
         assert_eq!(crew.len(), 2);
         assert_eq!(crew[0].task, "tui-layout");
+        assert_eq!(
+            crew[0].name, "fm-ab12-tui-layout",
+            "the container name is what podman exec addresses"
+        );
         assert_eq!(crew[0].health, Health::Working);
         assert_eq!(crew[0].status, "Up 5 minutes");
         assert_eq!(crew[1].task, "crew-health");
@@ -386,11 +456,38 @@ mod tests {
         assert!(parse_ps("not json").is_err());
     }
 
+    /// A preview must never be able to type at a crewmate's harness, and must
+    /// not drag the crewmate's own screen down to the size of the popup.
+    #[test]
+    fn the_preview_client_is_read_only_and_does_not_resize_the_crewmate() {
+        let (program, args) = session_command("fm-ab12-one", Join::Preview);
+        assert_eq!(program, "podman");
+        let script = args.join(" ");
+        assert!(script.contains("exec -it fm-ab12-one"), "{script}");
+        assert!(script.contains("attach -r -f ignore-size"), "{script}");
+        // An older tmux without the flag still has to get a read-only client.
+        assert!(script.contains("|| exec tmux attach -r"), "{script}");
+        // The session name is its own argument, never spliced into the script.
+        assert_eq!(args.last().map(String::as_str), Some("work"));
+    }
+
+    /// Boarding is the captain taking the keyboard, so it is an ordinary
+    /// read-write client and its size is meant to count.
+    #[test]
+    fn the_attach_client_is_an_ordinary_read_write_tmux_client() {
+        let (_, args) = session_command("fm-ab12-one", Join::Attach);
+        assert_eq!(
+            args,
+            vec!["exec", "-it", "fm-ab12-one", "tmux", "attach", "-t", "work"]
+        );
+    }
+
     #[test]
     fn set_error_clears_the_roster_and_reports_change_once() {
         let mut panel = CrewPanel::new();
         assert!(panel.set(vec![Crewmate {
             task: "a".into(),
+            name: "fm-ab12-a".into(),
             health: Health::Working,
             status: "Up".into(),
         }]));
@@ -403,6 +500,7 @@ mod tests {
         let mut panel = CrewPanel::new();
         let snap = vec![Crewmate {
             task: "a".into(),
+            name: "fm-ab12-a".into(),
             health: Health::Working,
             status: "Up".into(),
         }];

@@ -235,7 +235,12 @@ impl CrewPanel {
         }
     }
 
-    pub fn scroll_down(&mut self) {
+    /// The crewmate under the cursor, if the roster has one.
+    pub fn selected(&self) -> Option<&Crewmate> {
+        self.state.selected().and_then(|i| self.crew.get(i))
+    }
+
+    pub fn select_next(&mut self) {
         if self.crew.is_empty() {
             return;
         }
@@ -244,7 +249,7 @@ impl CrewPanel {
         self.state.select(Some(next));
     }
 
-    pub fn scroll_up(&mut self) {
+    pub fn select_prev(&mut self) {
         if self.crew.is_empty() {
             return;
         }

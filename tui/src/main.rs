@@ -507,10 +507,19 @@ fn handle_running_key(app: &mut App, key: KeyEvent) -> Step {
             if key.code == KeyCode::Char('q') {
                 return Step::Quit;
             }
-            // Scrolling the sidebars keeps command mode so a run of keys walks
+            // Esc is the deliberate way out of command mode, and it takes any
+            // overlay command mode raised down with it.
+            if key.code == KeyCode::Esc {
+                app.focus = Focus::Terminal;
+                app.task_detail = false;
+                return Step::Continue;
+            }
+            // Walking the sidebars keeps command mode so a run of keys walks
             // the lists; the status bar names these while command mode is up.
-            // Walking the backlog pops the selected task's full description
-            // over the TUI, since the sidebar can only show a clipped title.
+            // Up/Down walk the backlog and Left/Right walk the crew, one axis
+            // per sidebar. Walking the backlog pops the selected task's full
+            // description over the TUI, since the sidebar can only show a
+            // clipped title.
             match key.code {
                 KeyCode::Up => {
                     return command_stay(app, |a| {
@@ -524,15 +533,15 @@ fn handle_running_key(app: &mut App, key: KeyEvent) -> Step {
                         a.task_detail = a.tasks_visible;
                     })
                 }
-                KeyCode::PageUp => {
+                KeyCode::Left => {
                     return command_stay(app, |a| {
-                        a.crew.scroll_up();
+                        a.crew.select_prev();
                         a.task_detail = false;
                     })
                 }
-                KeyCode::PageDown => {
+                KeyCode::Right => {
                     return command_stay(app, |a| {
-                        a.crew.scroll_down();
+                        a.crew.select_next();
                         a.task_detail = false;
                     })
                 }
@@ -756,7 +765,7 @@ fn status_hint(app: &App) -> (String, Style, bool) {
     } else {
         match app.focus {
             Focus::Command => (
-                " command - q quits, up/down scroll tasks, pgup/pgdn scroll crew, ctrl+b sends ctrl+b, any other key returns ".to_string(),
+                " command - q quits, up/down walk tasks, left/right pick crew, ctrl+b sends ctrl+b, esc returns ".to_string(),
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
@@ -1348,7 +1357,7 @@ mod tests {
 
         // Navigating to the crew list, and leaving command mode entirely, both
         // take the overlay back down.
-        handle_running_key(&mut app, key(KeyCode::PageDown));
+        handle_running_key(&mut app, key(KeyCode::Right));
         assert!(!app.task_detail);
 
         handle_running_key(&mut app, key(KeyCode::Up));
@@ -1411,8 +1420,81 @@ mod tests {
         assert!(!app.task_detail);
     }
 
-    /// Command mode scrolls the sidebars in place and only leaves for a key
-    /// that is not a scroll key.
+    fn sample_crew() -> Vec<crew::Crewmate> {
+        crew::parse_ps(
+            r#"[
+              {"Names":["fm-ab12-one"],"State":"running","Status":"Up 2 minutes","Labels":{"firstmate.task":"one"}},
+              {"Names":["fm-ab12-two"],"State":"running","Status":"Up 3 minutes","Labels":{"firstmate.task":"two"}}
+            ]"#,
+        )
+        .expect("sample podman ps json parses")
+    }
+
+    /// Left/Right are the crew's own axis, the mirror of Up/Down on the
+    /// backlog, and they keep command mode so a run of them walks the roster.
+    #[test]
+    fn command_mode_left_and_right_walk_the_crew() {
+        let mut app = running_app();
+        app.crew.set(sample_crew());
+
+        handle_running_key(&mut app, ctrl(PREFIX));
+        assert_eq!(
+            handle_running_key(&mut app, key(KeyCode::Right)),
+            Step::Continue
+        );
+        assert_eq!(app.focus, Focus::Command, "a crew key keeps command mode");
+        assert_eq!(app.crew.selected().map(|c| c.task.as_str()), Some("two"));
+
+        handle_running_key(&mut app, key(KeyCode::Right));
+        assert_eq!(
+            app.crew.selected().map(|c| c.task.as_str()),
+            Some("two"),
+            "the cursor stops at the end of the roster"
+        );
+
+        handle_running_key(&mut app, key(KeyCode::Left));
+        assert_eq!(app.crew.selected().map(|c| c.task.as_str()), Some("one"));
+        handle_running_key(&mut app, key(KeyCode::Left));
+        assert_eq!(
+            app.crew.selected().map(|c| c.task.as_str()),
+            Some("one"),
+            "the cursor stops at the start of the roster"
+        );
+    }
+
+    /// An empty roster has nothing to pick, and walking it must not panic or
+    /// invent a selection.
+    #[test]
+    fn walking_an_empty_crew_selects_nothing() {
+        let mut app = running_app();
+        handle_running_key(&mut app, ctrl(PREFIX));
+        handle_running_key(&mut app, key(KeyCode::Right));
+        handle_running_key(&mut app, key(KeyCode::Left));
+        assert!(app.crew.selected().is_none());
+        assert_eq!(app.focus, Focus::Command);
+    }
+
+    /// Esc is the deliberate way out of command mode from any point in it,
+    /// and it must not reach the harness as a keystroke either.
+    #[test]
+    fn esc_leaves_command_mode_from_anywhere_in_it() {
+        let mut app = running_app();
+        app.crew.set(sample_crew());
+
+        // Straight out of the bare chord.
+        handle_running_key(&mut app, ctrl(PREFIX));
+        assert_eq!(handle_running_key(&mut app, key(KeyCode::Esc)), Step::Continue);
+        assert_eq!(app.focus, Focus::Terminal);
+
+        // And out of a walk of either sidebar.
+        handle_running_key(&mut app, ctrl(PREFIX));
+        handle_running_key(&mut app, key(KeyCode::Right));
+        handle_running_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.focus, Focus::Terminal);
+    }
+
+    /// Command mode walks the sidebars in place and only leaves for a key
+    /// that is not a navigation key.
     #[test]
     fn command_mode_scrolls_the_sidebars_and_stays() {
         let mut app = running_app();

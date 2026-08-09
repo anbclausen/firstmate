@@ -66,12 +66,12 @@ That leaves no ordinary key free to quit on, so the TUI reserves exactly one cho
 - `Ctrl+B` switches to command mode; the status bar turns cyan to say so.
 - `Ctrl+B` then `q` quits the TUI and terminates the harness.
   This works whenever the harness owns the keyboard, which is every state except a decision box being up.
-- `Ctrl+B` then `Up`/`Down` walks the `tasks` pane, and `Ctrl+B` then `PageUp`/`PageDown` scrolls the `crew` list; scroll keys keep command mode so a run of them walks the list.
+- `Ctrl+B` then `Up`/`Down` walks the `tasks` pane, and `Ctrl+B` then `Left`/`Right` picks a crewmate in the `crew` list; one axis per sidebar, and both keep command mode so a run of them walks the list.
   Walking the tasks pane pops the selected task's full description - the whole bullet plus its body lines - over the TUI, since the pane can only show a clipped title.
-  It comes back down as soon as the captain scrolls the crew list, leaves command mode, or a decision box arrives, and it never comes up at all on a terminal too narrow to seat the tasks pane or once the backlog no longer has the selected task.
+  It comes back down as soon as the captain picks a crewmate, leaves command mode, or a decision box arrives, and it never comes up at all on a terminal too narrow to seat the tasks pane or once the backlog no longer has the selected task.
   The overlay is a fixed size, so an item too long to fit is titled `task - truncated` rather than being cut off silently.
 - `Ctrl+B` then `Ctrl+B` sends a literal `Ctrl+B` on to the harness.
-- `Ctrl+B` then any other key returns to the terminal without doing anything.
+- `Ctrl+B` then `Esc` leaves command mode and takes any overlay it raised back down; any other key also returns to the terminal without doing anything.
 - Once the harness has exited there is nothing left to type into, so plain `q`, `Esc`, and `Ctrl+C` quit directly.
 
 `src/keys.rs` owns the key-to-bytes translation, including the control bytes, the arrow and function-key escape sequences, and the DECCKM (application cursor keys) variants a full-screen harness switches on.

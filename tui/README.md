@@ -73,6 +73,7 @@ That leaves no ordinary key free to quit on, so the TUI reserves exactly one cho
   Walking the crew pops the matching overlay for a crewmate: a live look-in on that crewmate's own session (see below).
   Each sidebar's overlay takes the other's down, so only one is ever up.
 - `Ctrl+B` then `Enter` on a picked crewmate attaches to that crewmate's session, which then owns the agent pane and the keyboard.
+  It has to be a crewmate the captain picked with `Left`/`Right`: the crew list highlights its first entry on its own so the list has a cursor at all, and that is the TUI's doing rather than a choice to board anyone.
 - `Ctrl+B` then `f` returns to firstmate's own session from anywhere - an attached crewmate, a look-in, a backlog overlay - and takes every overlay down on the way.
 - `Ctrl+B` then `Ctrl+B` sends a literal `Ctrl+B` on to the harness.
 - `Ctrl+B` then `Esc` leaves command mode and takes any overlay it raised back down; any other key also returns to the terminal without doing anything.
@@ -87,6 +88,9 @@ That leaves no ordinary key free to quit on, so the TUI reserves exactly one cho
 
 Each crewmate container runs its harness inside a tmux session created by [`bin/backends/podman.sh`](../bin/backends/podman.sh), which owns that session's name; `src/crew.rs` reads the same `FM_BACKEND_PODMAN_TMUX_SESSION` override so a fleet that renamed it stays reachable from here.
 Both the look-in and attaching are a `podman exec` into that container joining that session, run on a pty of their own by `src/child.rs`, so each is a real terminal rather than a rendered transcript.
+
+Joining forks a client into the crewmate's container, so the look-in waits for the crew cursor to stand still before it opens: walking past four crewmates to reach the fifth joins that fifth one only.
+A look-in still waiting on the cursor is dropped along with the one on screen whenever the captain leaves the crew, so nothing opens behind them.
 
 The look-in is a read-only tmux client, so no keystroke can reach a crewmate's harness through it.
 It also asks tmux not to let its size count, because the popup is far smaller than the pane and a client that counted would reflow the crewmate's own screen down to the size of the captain's peek.

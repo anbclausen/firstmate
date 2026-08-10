@@ -53,6 +53,12 @@ const HEAD_QUIET: Duration = Duration::from_millis(600);
 /// really is working writes again a frame later and gets under way then.
 const HEAD_ECHO: Duration = Duration::from_millis(250);
 
+/// How long the crew cursor has to stand still before the look-in on it is
+/// actually joined. Joining forks a client into a crewmate's container, so a
+/// captain holding Left or Right past four crewmates to reach the fifth must
+/// cost one of those, not five.
+const CREW_SETTLE: Duration = Duration::from_millis(120);
+
 fn repo_root() -> PathBuf {
     // This binary lives at <repo>/tui; walk up from the crate manifest dir
     // at compile time so it works regardless of the process's cwd.
@@ -212,6 +218,16 @@ struct App {
     /// The live look-in on the selected crewmate, raised by walking the crew
     /// in command mode and dropped as soon as the captain leaves it.
     crew_preview: Option<CrewSession>,
+    /// When the cursor's current crewmate may be joined, set while the captain
+    /// is still walking and cleared once the look-in is up. Each crew key
+    /// supersedes the last one's deadline, so a run of them joins only the
+    /// crewmate the cursor stops on.
+    crew_settles: Option<Instant>,
+    /// Whether the captain actually picked a crewmate with Left/Right. A fresh
+    /// roster puts the cursor on its first entry so the list has a highlight,
+    /// which is not a choice, so Enter must not board anybody on the strength
+    /// of it.
+    crew_picked: bool,
     /// The crewmate session the captain attached to, which owns the agent pane
     /// until they return to firstmate.
     attached: Option<CrewSession>,
@@ -241,47 +257,87 @@ impl App {
             tasks_visible: false,
             crew_visible: false,
             crew_preview: None,
+            crew_settles: None,
+            crew_picked: false,
             attached: None,
             preview_size: INITIAL_SIZE,
             crew_launcher: podman_crew_session,
         }
     }
 
-    /// Raises the live look-in on the crewmate under the cursor, replacing a
-    /// preview of a different crewmate and leaving an unchanged one alone so a
-    /// repeated key does not restart the client.
+    /// The captain has moved the crew cursor: takes down a look-in that is now
+    /// on the wrong crewmate and puts the new one in hand, to be joined once
+    /// the cursor settles. A cursor that came back to the crewmate already on
+    /// screen keeps that look-in rather than restarting the client.
     fn show_crew_preview(&mut self) {
         let Some(crew) = self.crew.selected().filter(|_| self.crew_visible).cloned() else {
-            self.close_crew_preview();
+            self.leave_crew();
             return;
         };
+        self.crew_picked = true;
         if self
             .crew_preview
             .as_ref()
             .is_some_and(|session| session.crew == crew.task)
         {
+            self.crew_settles = None;
             return;
         }
         self.close_crew_preview();
+        self.crew_settles = Some(Instant::now() + CREW_SETTLE);
+    }
+
+    /// Joins the crewmate the cursor came to rest on. Returns whether anything
+    /// on screen changed, and is a no-op until the cursor has stood still, so
+    /// the client is forked once for a run of crew keys rather than once per
+    /// key.
+    fn settle_crew_preview(&mut self) -> bool {
+        let Some(due) = self.crew_settles else {
+            return false;
+        };
+        if Instant::now() < due {
+            return false;
+        }
+        self.crew_settles = None;
+        let Some(crew) = self.crew.selected().filter(|_| self.crew_visible).cloned() else {
+            return false;
+        };
         self.crew_preview = self.open_crew_session(&crew, Join::Preview, self.preview_size);
+        true
     }
 
     fn close_crew_preview(&mut self) {
+        // A look-in still waiting on the cursor is one this takes down too,
+        // otherwise it would open a moment after the captain closed it.
+        self.crew_settles = None;
         if let Some(mut session) = self.crew_preview.take() {
             session.close();
         }
     }
 
-    /// Hands the agent pane to the crewmate under the cursor. Returns whether
+    /// The captain is done with the crew: the look-in comes down, and Enter is
+    /// no longer theirs until they pick a crewmate again.
+    fn leave_crew(&mut self) {
+        self.close_crew_preview();
+        self.crew_picked = false;
+    }
+
+    /// Hands the agent pane to the crewmate the captain picked. Returns whether
     /// the captain is now looking at that crewmate's session.
     fn attach_to_selected_crew(&mut self) -> bool {
+        if !self.crew_picked {
+            return false;
+        }
         let Some(crew) = self.crew.selected().filter(|_| self.crew_visible).cloned() else {
             return false;
         };
-        self.close_crew_preview();
         let Some(session) = self.open_crew_session(&crew, Join::Attach, self.pty_size) else {
             return false;
         };
+        // Boarding gives the crewmate the whole pane, so nothing command mode
+        // raised over firstmate's own session may be left standing on top.
+        self.leave_crew();
+        self.task_detail = false;
         self.detach();
         self.attached = Some(session);
         true
@@ -313,7 +369,7 @@ impl App {
     /// the way out to a crewmate taken down with it.
     fn return_to_firstmate(&mut self) {
         self.detach();
-        self.close_crew_preview();
+        self.leave_crew();
         self.task_detail = false;
         self.focus = Focus::Terminal;
     }
@@ -384,7 +440,7 @@ impl App {
                     // TUI must not survive into it.
                     self.focus = Focus::Terminal;
                     self.task_detail = false;
-                    self.close_crew_preview();
+                    self.leave_crew();
                 }
                 ChildEvent::DecisionParseError(err) => {
                     self.notice = Some(format!("malformed decision payload: {err}"));
@@ -447,7 +503,7 @@ impl App {
         }
         self.crew_visible = areas.crew.is_some();
         if !self.crew_visible {
-            self.close_crew_preview();
+            self.leave_crew();
         }
         let pane = areas.pane;
 
@@ -661,6 +717,12 @@ fn run(
             app.sync_size(Rect::new(0, 0, size.width, size.height));
         }
 
+        // After the size is current, so a look-in the captain has settled on
+        // opens straight at the size of the overlay it is drawn into.
+        if app.settle_crew_preview() {
+            dirty = true;
+        }
+
         if dirty {
             terminal.draw(|frame| draw(frame, app))?;
             dirty = false;
@@ -764,7 +826,7 @@ fn handle_running_key(app: &mut App, key: KeyEvent) -> Step {
             // the captain attached to in the pane, since that is the session
             // they asked for; `f` is what comes back from it.
             if key.code == KeyCode::Esc {
-                app.close_crew_preview();
+                app.leave_crew();
                 app.focus = Focus::Terminal;
                 app.task_detail = false;
                 return Step::Continue;
@@ -781,14 +843,14 @@ fn handle_running_key(app: &mut App, key: KeyEvent) -> Step {
                 KeyCode::Up => {
                     return command_stay(app, |a| {
                         a.tasks.scroll_up();
-                        a.close_crew_preview();
+                        a.leave_crew();
                         a.task_detail = a.tasks_visible;
                     })
                 }
                 KeyCode::Down => {
                     return command_stay(app, |a| {
                         a.tasks.scroll_down();
-                        a.close_crew_preview();
+                        a.leave_crew();
                         a.task_detail = a.tasks_visible;
                     })
                 }
@@ -806,8 +868,8 @@ fn handle_running_key(app: &mut App, key: KeyEvent) -> Step {
                         a.show_crew_preview();
                     })
                 }
-                // Enter on a crewmate hands them the pane. With no crewmate
-                // under the cursor there is nothing to open, so it falls
+                // Enter on a crewmate the captain picked hands them the pane.
+                // With nobody picked there is nothing to open, so it falls
                 // through and just leaves command mode.
                 KeyCode::Enter => {
                     if app.attach_to_selected_crew() {
@@ -824,7 +886,7 @@ fn handle_running_key(app: &mut App, key: KeyEvent) -> Step {
             }
             app.focus = Focus::Terminal;
             app.task_detail = false;
-            app.close_crew_preview();
+            app.leave_crew();
             Step::Continue
         }
         Focus::Terminal => {
@@ -1196,6 +1258,7 @@ mod tests {
     use super::*;
     use crate::decision::{Decision, SENTINEL};
     use ratatui::backend::TestBackend;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn running_app() -> App {
         let mut app = App::new();
@@ -1220,16 +1283,26 @@ mod tests {
         app
     }
 
+    /// The event loop's own between-keystroke work - draining the sessions and
+    /// joining a look-in whose cursor has settled - run until `done`.
     fn pump_until(app: &mut App, done: impl Fn(&App) -> bool) -> bool {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             app.poll_child();
+            app.settle_crew_preview();
             if done(app) {
                 return true;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
         false
+    }
+
+    /// Waits for the look-in the captain settled on, which the debounce holds
+    /// back for a moment after the last crew key.
+    fn settled_look_in(app: &mut App) -> Option<String> {
+        pump_until(app, |a| a.crew_settles.is_none() && a.crew_preview.is_some());
+        app.crew_preview.as_ref().map(|s| s.crew.clone())
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1828,6 +1901,7 @@ mod tests {
         // And out of a walk of either sidebar.
         handle_running_key(&mut app, ctrl(PREFIX));
         handle_running_key(&mut app, key(KeyCode::Right));
+        settled_look_in(&mut app);
         handle_running_key(&mut app, key(KeyCode::Esc));
         assert_eq!(app.focus, Focus::Terminal);
         assert!(app.crew_preview.is_none(), "esc takes the look-in down too");
@@ -1844,19 +1918,16 @@ mod tests {
 
         handle_running_key(&mut app, ctrl(PREFIX));
         assert!(
-            app.crew_preview.is_none(),
+            app.crew_preview.is_none() && app.crew_settles.is_none(),
             "the chord alone must not raise it"
         );
 
         handle_running_key(&mut app, key(KeyCode::Right));
-        assert_eq!(
-            app.crew_preview.as_ref().map(|s| s.crew.as_str()),
-            Some("two")
-        );
+        assert_eq!(settled_look_in(&mut app).as_deref(), Some("two"));
 
         handle_running_key(&mut app, key(KeyCode::Left));
         assert_eq!(
-            app.crew_preview.as_ref().map(|s| s.crew.as_str()),
+            settled_look_in(&mut app).as_deref(),
             Some("one"),
             "the look-in follows the cursor"
         );
@@ -1869,12 +1940,119 @@ mod tests {
         app.kill_child();
     }
 
+    /// How many look-ins `counting_crew_session` has been asked for. It is its
+    /// own launcher so no other test's sessions can be counted into it.
+    static LOOK_INS: AtomicUsize = AtomicUsize::new(0);
+
+    fn counting_crew_session(_: &Crewmate, join: Join) -> (String, Vec<String>) {
+        if join == Join::Preview {
+            LOOK_INS.fetch_add(1, Ordering::SeqCst);
+        }
+        ("cat".to_string(), Vec::new())
+    }
+
+    /// Joining a look-in forks a client into a crewmate's container, so walking
+    /// past crewmates to reach one must cost a single client rather than one
+    /// per keypress.
+    #[test]
+    fn a_run_of_crew_keys_only_looks_in_on_where_the_cursor_stops() {
+        let mut app = app_with_crew();
+        app.crew_launcher = counting_crew_session;
+        LOOK_INS.store(0, Ordering::SeqCst);
+
+        handle_running_key(&mut app, ctrl(PREFIX));
+        for code in [KeyCode::Right, KeyCode::Left, KeyCode::Right, KeyCode::Left] {
+            handle_running_key(&mut app, key(code));
+        }
+        assert_eq!(
+            LOOK_INS.load(Ordering::SeqCst),
+            0,
+            "a cursor still moving must not have been joined yet"
+        );
+
+        assert_eq!(settled_look_in(&mut app).as_deref(), Some("one"));
+        assert_eq!(
+            LOOK_INS.load(Ordering::SeqCst),
+            1,
+            "only the crewmate the cursor stopped on is joined"
+        );
+
+        // And standing still on that same crewmate keeps the one client rather
+        // than restarting it.
+        handle_running_key(&mut app, key(KeyCode::Left));
+        assert!(app.crew_settles.is_none());
+        let quiet = Instant::now() + CREW_SETTLE * 3;
+        while Instant::now() < quiet {
+            app.poll_child();
+            app.settle_crew_preview();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(LOOK_INS.load(Ordering::SeqCst), 1);
+
+        app.kill_child();
+    }
+
+    /// A fresh roster highlights its first entry so the list has a cursor at
+    /// all, which is the TUI's doing and not the captain's choice. Enter must
+    /// board only a crewmate they actually picked.
+    #[test]
+    fn enter_boards_nobody_until_a_crewmate_is_picked() {
+        let mut app = app_with_crew();
+        assert!(
+            app.crew.selected().is_some(),
+            "the roster highlights its first entry on its own"
+        );
+
+        handle_running_key(&mut app, ctrl(PREFIX));
+        assert_eq!(
+            handle_running_key(&mut app, key(KeyCode::Enter)),
+            Step::Continue
+        );
+        assert!(app.attached.is_none(), "the chord alone boarded a crewmate");
+        assert_eq!(app.focus, Focus::Terminal, "enter still leaves command mode");
+
+        // Walking the backlog is the other sidebar's axis, so Enter is not the
+        // crew's there either.
+        app.set_tasks(tasks::parse_backlog(
+            "## In flight\n- [ ] tui-layout - build it (since 2026-07-27)\n",
+        ));
+        handle_running_key(&mut app, ctrl(PREFIX));
+        handle_running_key(&mut app, key(KeyCode::Down));
+        handle_running_key(&mut app, key(KeyCode::Enter));
+        assert!(app.attached.is_none());
+
+        // Picking one is what hands them the pane.
+        handle_running_key(&mut app, ctrl(PREFIX));
+        handle_running_key(&mut app, key(KeyCode::Right));
+        handle_running_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.attached.as_ref().map(|s| s.crew.as_str()), Some("two"));
+
+        app.kill_child();
+    }
+
+    /// Boarding gives the crewmate the whole pane, so a backlog overlay command
+    /// mode raised over firstmate's own session must not be left on top of it.
+    #[test]
+    fn boarding_a_crewmate_takes_the_backlog_overlay_down() {
+        let mut app = app_with_crew();
+        handle_running_key(&mut app, ctrl(PREFIX));
+        handle_running_key(&mut app, key(KeyCode::Right));
+        app.task_detail = true;
+
+        handle_running_key(&mut app, key(KeyCode::Enter));
+        assert!(app.attached.is_some());
+        assert!(!app.task_detail);
+
+        app.kill_child();
+    }
+
     /// The look-in is the crewmate's real screen, not a summary of it.
     #[test]
     fn the_look_in_renders_the_crewmates_own_screen() {
         let mut app = app_with_crew();
         handle_running_key(&mut app, ctrl(PREFIX));
         handle_running_key(&mut app, key(KeyCode::Right));
+        settled_look_in(&mut app);
 
         app.crew_preview
             .as_mut()
@@ -1946,7 +2124,7 @@ mod tests {
 
         handle_running_key(&mut app, ctrl(PREFIX));
         handle_running_key(&mut app, key(KeyCode::Left));
-        assert!(app.crew_preview.is_some());
+        assert!(settled_look_in(&mut app).is_some());
 
         handle_running_key(&mut app, key(KeyCode::Esc));
         assert!(app.crew_preview.is_none());
@@ -1973,7 +2151,7 @@ mod tests {
         handle_running_key(&mut app, key(KeyCode::Enter));
         handle_running_key(&mut app, ctrl(PREFIX));
         handle_running_key(&mut app, key(KeyCode::Left));
-        assert!(app.attached.is_some() && app.crew_preview.is_some());
+        assert!(app.attached.is_some() && settled_look_in(&mut app).is_some());
 
         // Walking the crew is already command mode, so `f` lands directly,
         // exactly as `q` does.
@@ -2035,7 +2213,7 @@ mod tests {
 
         handle_running_key(&mut app, ctrl(PREFIX));
         handle_running_key(&mut app, key(KeyCode::Right));
-        assert!(app.crew_preview.is_none());
+        assert!(app.crew_preview.is_none() && app.crew_settles.is_none());
 
         assert_eq!(handle_running_key(&mut app, key(KeyCode::Enter)), Step::Continue);
         assert!(app.attached.is_none());

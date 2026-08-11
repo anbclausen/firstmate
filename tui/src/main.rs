@@ -32,7 +32,7 @@ use tui_term::widget::{Cursor, PseudoTerminal};
 
 use child::{Child, ChildEvent};
 use config::Harness;
-use crew::CrewPanel;
+use crew::{CrewPanel, Crewmate, Join};
 use decision_box::DecisionBox;
 use head::{Head, HeadState, Settled};
 use tasks::TasksPanel;
@@ -52,6 +52,12 @@ const HEAD_QUIET: Duration = Duration::from_millis(600);
 /// coming back rather than work of its own. Generous, because a session that
 /// really is working writes again a frame later and gets under way then.
 const HEAD_ECHO: Duration = Duration::from_millis(250);
+
+/// How long the crew cursor has to stand still before the look-in on it is
+/// actually joined. Joining forks a client into a crewmate's container, so a
+/// captain holding Left or Right past four crewmates to reach the fifth must
+/// cost one of those, not five.
+const CREW_SETTLE: Duration = Duration::from_millis(120);
 
 fn repo_root() -> PathBuf {
     // This binary lives at <repo>/tui; walk up from the crate manifest dir
@@ -101,6 +107,82 @@ enum Step {
     Quit,
 }
 
+/// A crewmate's own session, joined over a pty of its own: either the live
+/// read-only preview raised while the captain walks the crew, or the session
+/// they attached into, which then owns the agent pane.
+///
+/// Firstmate's own session is never one of these. It keeps its own child and
+/// its own emulator, which is what lets the captain attach to a crewmate
+/// without firstmate's session being torn down behind them and come straight
+/// back to it, scrollback and all.
+struct CrewSession {
+    /// The crewmate this session belongs to, so a moved cursor can tell
+    /// whether what is on screen is still the right crewmate.
+    crew: String,
+    child: Child,
+    parser: vt100::Parser,
+}
+
+impl CrewSession {
+    fn open(
+        crew: &str,
+        program: &str,
+        args: &[String],
+        rows: u16,
+        cols: u16,
+    ) -> anyhow::Result<Self> {
+        Ok(CrewSession {
+            crew: crew.to_string(),
+            child: child::spawn(program, args, None, rows, cols)?,
+            parser: vt100::Parser::new(rows, cols, SCROLLBACK),
+        })
+    }
+
+    /// Drains this session's output into its emulator. Returns whether
+    /// anything changed and, once the client is gone, its exit code.
+    fn poll(&mut self) -> (bool, Option<i32>) {
+        let mut changed = false;
+        let mut exited = None;
+        while let Ok(event) = self.child.events.try_recv() {
+            changed = true;
+            match event {
+                ChildEvent::Output(bytes) => self.parser.process(&bytes),
+                ChildEvent::Exited(code) => exited = Some(code),
+                // A crewmate's decision is answered by the firstmate running
+                // that crewmate, not from this pane, so the sentinel scrolling
+                // past here is ordinary output and nothing more.
+                ChildEvent::Decision(_) | ChildEvent::DecisionParseError(_) => {}
+            }
+        }
+        (changed, exited)
+    }
+
+    fn resize(&mut self, rows: u16, cols: u16) {
+        if rows == 0 || cols == 0 || (rows, cols) == self.parser.screen().size() {
+            return;
+        }
+        self.parser.screen_mut().set_size(rows, cols);
+        // A crewmate's session that will not take a resize still draws, just
+        // at the wrong width, which is not worth an alert over the pane.
+        let _ = self.child.resize(rows, cols);
+    }
+
+    /// Ends this client. A tmux client leaving is a detach, so the crewmate's
+    /// own session keeps running with its harness untouched.
+    fn close(&mut self) {
+        self.child.kill();
+    }
+}
+
+/// How a crewmate's session is launched. `podman_crew_session` is the real
+/// one; the tests point this at an ordinary child so the whole look-in and
+/// attach path runs over a real pty without a live podman.
+type CrewLauncher = fn(&Crewmate, Join) -> (String, Vec<String>);
+
+fn podman_crew_session(crew: &Crewmate, join: Join) -> (String, Vec<String>) {
+    crew::session_command(&crew.name, join)
+}
+
 struct App {
     mode: Mode,
     head: Head,
@@ -130,6 +212,29 @@ struct App {
     /// terminal too narrow for it must not pop a detail overlay for a pane
     /// that is not on screen.
     tasks_visible: bool,
+    /// The same for the crew pane: a selection the captain cannot see is not
+    /// one to preview or attach to.
+    crew_visible: bool,
+    /// The live look-in on the selected crewmate, raised by walking the crew
+    /// in command mode and dropped as soon as the captain leaves it.
+    crew_preview: Option<CrewSession>,
+    /// When the cursor's current crewmate may be joined, set while the captain
+    /// is still walking and cleared once the look-in is up. Each crew key
+    /// supersedes the last one's deadline, so a run of them joins only the
+    /// crewmate the cursor stops on.
+    crew_settles: Option<Instant>,
+    /// Whether the captain actually picked a crewmate with Left/Right. A fresh
+    /// roster puts the cursor on its first entry so the list has a highlight,
+    /// which is not a choice, so Enter must not board anybody on the strength
+    /// of it.
+    crew_picked: bool,
+    /// The crewmate session the captain attached to, which owns the agent pane
+    /// until they return to firstmate.
+    attached: Option<CrewSession>,
+    /// Size of the preview overlay's inside, kept by `sync_size` so a session
+    /// opened between frames starts at roughly the right size.
+    preview_size: (u16, u16),
+    crew_launcher: CrewLauncher,
 }
 
 impl App {
@@ -150,7 +255,123 @@ impl App {
             crew: CrewPanel::new(),
             task_detail: false,
             tasks_visible: false,
+            crew_visible: false,
+            crew_preview: None,
+            crew_settles: None,
+            crew_picked: false,
+            attached: None,
+            preview_size: INITIAL_SIZE,
+            crew_launcher: podman_crew_session,
         }
+    }
+
+    /// The captain has moved the crew cursor: takes down a look-in that is now
+    /// on the wrong crewmate and puts the new one in hand, to be joined once
+    /// the cursor settles. A cursor that came back to the crewmate already on
+    /// screen keeps that look-in rather than restarting the client.
+    fn show_crew_preview(&mut self) {
+        let Some(crew) = self.crew.selected().filter(|_| self.crew_visible).cloned() else {
+            self.leave_crew();
+            return;
+        };
+        self.crew_picked = true;
+        if self
+            .crew_preview
+            .as_ref()
+            .is_some_and(|session| session.crew == crew.task)
+        {
+            self.crew_settles = None;
+            return;
+        }
+        self.close_crew_preview();
+        self.crew_settles = Some(Instant::now() + CREW_SETTLE);
+    }
+
+    /// Joins the crewmate the cursor came to rest on. Returns whether anything
+    /// on screen changed, and is a no-op until the cursor has stood still, so
+    /// the client is forked once for a run of crew keys rather than once per
+    /// key.
+    fn settle_crew_preview(&mut self) -> bool {
+        let Some(due) = self.crew_settles else {
+            return false;
+        };
+        if Instant::now() < due {
+            return false;
+        }
+        self.crew_settles = None;
+        let Some(crew) = self.crew.selected().filter(|_| self.crew_visible).cloned() else {
+            return false;
+        };
+        self.crew_preview = self.open_crew_session(&crew, Join::Preview, self.preview_size);
+        true
+    }
+
+    fn close_crew_preview(&mut self) {
+        // A look-in still waiting on the cursor is one this takes down too,
+        // otherwise it would open a moment after the captain closed it.
+        self.crew_settles = None;
+        if let Some(mut session) = self.crew_preview.take() {
+            session.close();
+        }
+    }
+
+    /// The captain is done with the crew: the look-in comes down, and Enter is
+    /// no longer theirs until they pick a crewmate again.
+    fn leave_crew(&mut self) {
+        self.close_crew_preview();
+        self.crew_picked = false;
+    }
+
+    /// Hands the agent pane to the crewmate the captain picked. Returns whether
+    /// the captain is now looking at that crewmate's session.
+    fn attach_to_selected_crew(&mut self) -> bool {
+        if !self.crew_picked {
+            return false;
+        }
+        let Some(crew) = self.crew.selected().filter(|_| self.crew_visible).cloned() else {
+            return false;
+        };
+        let Some(session) = self.open_crew_session(&crew, Join::Attach, self.pty_size) else {
+            return false;
+        };
+        // Boarding gives the crewmate the whole pane, so nothing command mode
+        // raised over firstmate's own session may be left standing on top.
+        self.leave_crew();
+        self.task_detail = false;
+        self.detach();
+        self.attached = Some(session);
+        true
+    }
+
+    fn open_crew_session(
+        &mut self,
+        crew: &Crewmate,
+        join: Join,
+        size: (u16, u16),
+    ) -> Option<CrewSession> {
+        let (program, args) = (self.crew_launcher)(crew, join);
+        match CrewSession::open(&crew.task, &program, &args, size.0, size.1) {
+            Ok(session) => Some(session),
+            Err(err) => {
+                self.notice = Some(format!("could not reach {}: {err}", crew.task));
+                None
+            }
+        }
+    }
+
+    fn detach(&mut self) {
+        if let Some(mut session) = self.attached.take() {
+            session.close();
+        }
+    }
+
+    /// Firstmate's own session back in the pane, with every overlay raised on
+    /// the way out to a crewmate taken down with it.
+    fn return_to_firstmate(&mut self) {
+        self.detach();
+        self.leave_crew();
+        self.task_detail = false;
+        self.focus = Focus::Terminal;
     }
 
     /// Replaces the backlog and keeps the overlay honest: a shrinking backlog
@@ -183,7 +404,10 @@ impl App {
         self.mode = Mode::Running;
     }
 
+    /// Everything the TUI started, so no pty client outlives it.
     fn kill_child(&mut self) {
+        self.close_crew_preview();
+        self.detach();
         if let Some(child) = &mut self.child {
             child.kill();
         }
@@ -198,7 +422,7 @@ impl App {
                 events.push(event);
             }
         }
-        let changed = !events.is_empty();
+        let mut changed = !events.is_empty();
         for event in events {
             match event {
                 ChildEvent::Output(bytes) => {
@@ -212,10 +436,11 @@ impl App {
                     ping::ping();
                     self.decision = Some(DecisionBox::new(decision));
                     // The overlay owns the keyboard, so a half-entered
-                    // prefix chord and a task detail popped over the TUI must
-                    // not survive into it.
+                    // prefix chord and anything command mode popped over the
+                    // TUI must not survive into it.
                     self.focus = Focus::Terminal;
                     self.task_detail = false;
+                    self.leave_crew();
                 }
                 ChildEvent::DecisionParseError(err) => {
                     self.notice = Some(format!("malformed decision payload: {err}"));
@@ -226,6 +451,45 @@ impl App {
                 }
             }
         }
+        changed |= self.poll_crew_sessions();
+        changed
+    }
+
+    /// The same for the crewmate sessions, whose clients ending is a session
+    /// to take down rather than one to keep drawing. A crewmate's session
+    /// closing under the captain puts them back at firstmate rather than
+    /// leaving the pane frozen on a dead client.
+    fn poll_crew_sessions(&mut self) -> bool {
+        let mut changed = false;
+
+        let preview_ended = match &mut self.crew_preview {
+            Some(session) => {
+                let (drew, exited) = session.poll();
+                changed |= drew;
+                exited.map(|code| (session.crew.clone(), code))
+            }
+            None => None,
+        };
+        if let Some((crew, code)) = preview_ended {
+            self.close_crew_preview();
+            if code != 0 {
+                self.notice = Some(format!("could not look in on {crew} (exit {code})"));
+            }
+        }
+
+        let attach_ended = match &mut self.attached {
+            Some(session) => {
+                let (drew, exited) = session.poll();
+                changed |= drew;
+                exited.map(|_| session.crew.clone())
+            }
+            None => None,
+        };
+        if let Some(crew) = attach_ended {
+            self.detach();
+            self.notice = Some(format!("{crew}'s session closed - back at firstmate"));
+        }
+
         changed
     }
 
@@ -237,7 +501,23 @@ impl App {
         if !self.tasks_visible {
             self.task_detail = false;
         }
+        self.crew_visible = areas.crew.is_some();
+        if !self.crew_visible {
+            self.leave_crew();
+        }
         let pane = areas.pane;
+
+        let preview = Block::default()
+            .borders(Borders::ALL)
+            .inner(crew_preview_rect(pane));
+        let preview_size = (preview.height, preview.width);
+        if preview_size.0 > 0 && preview_size.1 > 0 && preview_size != self.preview_size {
+            self.preview_size = preview_size;
+            if let Some(session) = &mut self.crew_preview {
+                session.resize(preview_size.0, preview_size.1);
+            }
+        }
+
         let inner = Block::default().borders(Borders::ALL).inner(pane);
         let size = (inner.height, inner.width);
         if size.0 == 0 || size.1 == 0 || size == self.pty_size {
@@ -245,6 +525,9 @@ impl App {
         }
         self.pty_size = size;
         self.parser.screen_mut().set_size(size.0, size.1);
+        if let Some(session) = &mut self.attached {
+            session.resize(size.0, size.1);
+        }
         if let Some(child) = &mut self.child {
             if let Err(err) = child.resize(size.0, size.1) {
                 self.notice = Some(format!("could not resize the harness: {err}"));
@@ -252,11 +535,29 @@ impl App {
         }
     }
 
+    /// The emulator the captain is actually typing at, which is the crewmate's
+    /// while they are attached and firstmate's own otherwise.
+    fn screen(&self) -> &vt100::Screen {
+        match &self.attached {
+            Some(session) => session.parser.screen(),
+            None => self.parser.screen(),
+        }
+    }
+
     fn send_key(&mut self, key: KeyEvent) {
-        let modes = keys::Modes::application_cursor(self.parser.screen().application_cursor());
+        let modes = keys::Modes::application_cursor(self.screen().application_cursor());
         let Some(bytes) = keys::encode(key, modes) else {
             return;
         };
+        // While the captain is attached the keys are the crewmate's, and the
+        // figurehead follows firstmate's own session, so this must not tell it
+        // whose turn it is over there.
+        if let Some(session) = &mut self.attached {
+            if let Err(err) = session.child.write_input(&bytes) {
+                self.notice = Some(format!("could not reach {}: {err}", session.crew));
+            }
+            return;
+        }
         // The harness echoes these bytes straight back as output, which is
         // indistinguishable from work it is doing; telling the head whose turn
         // it is now is what stops a pause in the captain's typing being read as
@@ -272,9 +573,10 @@ impl App {
     }
 
     /// True once there is nothing left to type into, which is what makes
-    /// the plain quit keys safe to reclaim.
+    /// the plain quit keys safe to reclaim. A crewmate's session in the pane
+    /// is still something to type into, whatever became of firstmate's own.
     fn pane_is_dead(&self) -> bool {
-        self.child.is_none() || self.exited.is_some()
+        self.attached.is_none() && (self.child.is_none() || self.exited.is_some())
     }
 }
 
@@ -415,6 +717,12 @@ fn run(
             app.sync_size(Rect::new(0, 0, size.width, size.height));
         }
 
+        // After the size is current, so a look-in the captain has settled on
+        // opens straight at the size of the overlay it is drawn into.
+        if app.settle_crew_preview() {
+            dirty = true;
+        }
+
         if dirty {
             terminal.draw(|frame| draw(frame, app))?;
             dirty = false;
@@ -507,34 +815,67 @@ fn handle_running_key(app: &mut App, key: KeyEvent) -> Step {
             if key.code == KeyCode::Char('q') {
                 return Step::Quit;
             }
-            // Scrolling the sidebars keeps command mode so a run of keys walks
+            // The way home, from wherever command mode can be reached from:
+            // firstmate's own session back in the pane with every overlay down.
+            if key.code == KeyCode::Char('f') {
+                app.return_to_firstmate();
+                return Step::Continue;
+            }
+            // Esc is the deliberate way out of command mode, and it takes any
+            // overlay command mode raised down with it. It leaves a crewmate
+            // the captain attached to in the pane, since that is the session
+            // they asked for; `f` is what comes back from it.
+            if key.code == KeyCode::Esc {
+                app.leave_crew();
+                app.focus = Focus::Terminal;
+                app.task_detail = false;
+                return Step::Continue;
+            }
+            // Walking the sidebars keeps command mode so a run of keys walks
             // the lists; the status bar names these while command mode is up.
-            // Walking the backlog pops the selected task's full description
-            // over the TUI, since the sidebar can only show a clipped title.
+            // Up/Down walk the backlog and Left/Right walk the crew, one axis
+            // per sidebar, and each takes the other's overlay down so only one
+            // is ever up. Walking the backlog pops the selected task's full
+            // description over the TUI, since the sidebar can only show a
+            // clipped title; walking the crew pops a live look-in on the
+            // selected crewmate's own session.
             match key.code {
                 KeyCode::Up => {
                     return command_stay(app, |a| {
                         a.tasks.scroll_up();
+                        a.leave_crew();
                         a.task_detail = a.tasks_visible;
                     })
                 }
                 KeyCode::Down => {
                     return command_stay(app, |a| {
                         a.tasks.scroll_down();
+                        a.leave_crew();
                         a.task_detail = a.tasks_visible;
                     })
                 }
-                KeyCode::PageUp => {
+                KeyCode::Left => {
                     return command_stay(app, |a| {
-                        a.crew.scroll_up();
+                        a.crew.select_prev();
                         a.task_detail = false;
+                        a.show_crew_preview();
                     })
                 }
-                KeyCode::PageDown => {
+                KeyCode::Right => {
                     return command_stay(app, |a| {
-                        a.crew.scroll_down();
+                        a.crew.select_next();
                         a.task_detail = false;
+                        a.show_crew_preview();
                     })
+                }
+                // Enter on a crewmate the captain picked hands them the pane.
+                // With nobody picked there is nothing to open, so it falls
+                // through and just leaves command mode.
+                KeyCode::Enter => {
+                    if app.attach_to_selected_crew() {
+                        app.focus = Focus::Terminal;
+                        return Step::Continue;
+                    }
                 }
                 _ => {}
             }
@@ -545,6 +886,7 @@ fn handle_running_key(app: &mut App, key: KeyEvent) -> Step {
             }
             app.focus = Focus::Terminal;
             app.task_detail = false;
+            app.leave_crew();
             Step::Continue
         }
         Focus::Terminal => {
@@ -676,10 +1018,16 @@ fn draw_running(frame: &mut ratatui::Frame, app: &App) {
         app.crew.render(frame, crew_area);
     }
 
-    let screen = app.parser.screen();
-    let title = match app.harness {
-        Some(harness) => format!(" {harness} "),
-        None => " agent ".to_string(),
+    // The pane is firstmate's own session unless the captain attached to a
+    // crewmate, in which case it is theirs; firstmate's keeps running behind
+    // it either way.
+    let screen = app.screen();
+    let title = match &app.attached {
+        Some(session) => format!(" {} ", session.crew),
+        None => match app.harness {
+            Some(harness) => format!(" {harness} "),
+            None => " agent ".to_string(),
+        },
     };
     // The captain's caret belongs to the harness, so it is hidden while
     // anything else owns the keyboard.
@@ -722,6 +1070,22 @@ fn draw_running(frame: &mut ratatui::Frame, app: &App) {
         }
     }
 
+    // The look-in is up only while the captain is walking the crew, and a
+    // decision box outranks it the same way. It is the crewmate's real screen,
+    // rendered from a read-only client, so the caret is not the captain's to
+    // show.
+    if app.decision.is_none() {
+        if let Some(session) = &app.crew_preview {
+            let popup = crew_preview_rect(areas.pane);
+            frame.render_widget(Clear, popup);
+            let title = format!(" {} - looking in ", session.crew);
+            let look = PseudoTerminal::new(session.parser.screen())
+                .block(Block::default().borders(Borders::ALL).title(title))
+                .cursor(Cursor::default().visibility(false));
+            frame.render_widget(look, popup);
+        }
+    }
+
     if let Some(decision) = &app.decision {
         let popup = centered_rect(60, 40, areas.pane);
         frame.render_widget(Clear, popup);
@@ -738,6 +1102,21 @@ fn status_hint(app: &App) -> (String, Style, bool) {
             format!(" {notice} "),
             Style::default().fg(Color::Black).bg(Color::Red),
         )
+    } else if app.decision.is_some() {
+        (
+            " decision - up/down to choose, enter to pick, esc to dismiss ".to_string(),
+            Style::default().fg(Color::Black).bg(Color::Yellow),
+        )
+    } else if let Some(session) = &app.attached {
+        // Whatever became of firstmate's own session behind it, what the pane
+        // is showing is the crewmate's, so that is what the bar reports.
+        (
+            format!(
+                " attached to {} - ctrl+b then f returns to firstmate ",
+                session.crew
+            ),
+            Style::default().fg(Color::Black).bg(Color::Magenta),
+        )
     } else if let Some(code) = app.exited {
         (
             format!(" harness exited ({code}) - press q to quit "),
@@ -748,15 +1127,10 @@ fn status_hint(app: &App) -> (String, Style, bool) {
             " no harness running - press q to quit ".to_string(),
             Style::default().fg(Color::Black).bg(Color::Red),
         )
-    } else if app.decision.is_some() {
-        (
-            " decision - up/down to choose, enter to pick, esc to dismiss ".to_string(),
-            Style::default().fg(Color::Black).bg(Color::Yellow),
-        )
     } else {
         match app.focus {
             Focus::Command => (
-                " command - q quits, up/down scroll tasks, pgup/pgdn scroll crew, ctrl+b sends ctrl+b, any other key returns ".to_string(),
+                " command - q quits, up/down tasks, left/right crew, enter attaches, ctrl+b then f firstmate, esc returns ".to_string(),
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
@@ -851,6 +1225,14 @@ fn legend_line(budget: u16) -> Option<Line<'static>> {
     ))
 }
 
+/// Where the live look-in on a crewmate sits: centred over the agent pane, so
+/// firstmate's own session stays visible around it. `sync_size` and the draw
+/// both compute it from the same pane rect, which is what keeps the emulator
+/// the same size as the overlay it is drawn into.
+fn crew_preview_rect(pane: Rect) -> Rect {
+    centered_rect(70, 60, pane)
+}
+
 fn centered_rect(percent_x: u16, percent_y: u16, r: ratatui::layout::Rect) -> ratatui::layout::Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -876,12 +1258,51 @@ mod tests {
     use super::*;
     use crate::decision::{Decision, SENTINEL};
     use ratatui::backend::TestBackend;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn running_app() -> App {
         let mut app = App::new();
         app.mode = Mode::Running;
         app.tasks_visible = true;
+        app.crew_visible = true;
         app
+    }
+
+    /// `cat` on a pty is a live session that echoes, which is enough to prove
+    /// which session the pane is showing and where the captain's keys land.
+    fn fake_crew_session(_: &Crewmate, _: Join) -> (String, Vec<String>) {
+        ("cat".to_string(), Vec::new())
+    }
+
+    /// A running app whose crewmate sessions are those local children.
+    fn app_with_crew() -> App {
+        let mut app = running_app();
+        app.harness = Some(Harness::Claude);
+        app.crew_launcher = fake_crew_session;
+        app.crew.set(sample_crew());
+        app
+    }
+
+    /// The event loop's own between-keystroke work - draining the sessions and
+    /// joining a look-in whose cursor has settled - run until `done`.
+    fn pump_until(app: &mut App, done: impl Fn(&App) -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            app.poll_child();
+            app.settle_crew_preview();
+            if done(app) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// Waits for the look-in the captain settled on, which the debounce holds
+    /// back for a moment after the last crew key.
+    fn settled_look_in(app: &mut App) -> Option<String> {
+        pump_until(app, |a| a.crew_settles.is_none() && a.crew_preview.is_some());
+        app.crew_preview.as_ref().map(|s| s.crew.clone())
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1348,7 +1769,7 @@ mod tests {
 
         // Navigating to the crew list, and leaving command mode entirely, both
         // take the overlay back down.
-        handle_running_key(&mut app, key(KeyCode::PageDown));
+        handle_running_key(&mut app, key(KeyCode::Right));
         assert!(!app.task_detail);
 
         handle_running_key(&mut app, key(KeyCode::Up));
@@ -1411,8 +1832,397 @@ mod tests {
         assert!(!app.task_detail);
     }
 
-    /// Command mode scrolls the sidebars in place and only leaves for a key
-    /// that is not a scroll key.
+    fn sample_crew() -> Vec<crew::Crewmate> {
+        crew::parse_ps(
+            r#"[
+              {"Names":["fm-ab12-one"],"State":"running","Status":"Up 2 minutes","Labels":{"firstmate.task":"one"}},
+              {"Names":["fm-ab12-two"],"State":"running","Status":"Up 3 minutes","Labels":{"firstmate.task":"two"}}
+            ]"#,
+        )
+        .expect("sample podman ps json parses")
+    }
+
+    /// Left/Right are the crew's own axis, the mirror of Up/Down on the
+    /// backlog, and they keep command mode so a run of them walks the roster.
+    #[test]
+    fn command_mode_left_and_right_walk_the_crew() {
+        let mut app = app_with_crew();
+
+        handle_running_key(&mut app, ctrl(PREFIX));
+        assert_eq!(
+            handle_running_key(&mut app, key(KeyCode::Right)),
+            Step::Continue
+        );
+        assert_eq!(app.focus, Focus::Command, "a crew key keeps command mode");
+        assert_eq!(app.crew.selected().map(|c| c.task.as_str()), Some("two"));
+
+        handle_running_key(&mut app, key(KeyCode::Right));
+        assert_eq!(
+            app.crew.selected().map(|c| c.task.as_str()),
+            Some("two"),
+            "the cursor stops at the end of the roster"
+        );
+
+        handle_running_key(&mut app, key(KeyCode::Left));
+        assert_eq!(app.crew.selected().map(|c| c.task.as_str()), Some("one"));
+        handle_running_key(&mut app, key(KeyCode::Left));
+        assert_eq!(
+            app.crew.selected().map(|c| c.task.as_str()),
+            Some("one"),
+            "the cursor stops at the start of the roster"
+        );
+
+        app.kill_child();
+    }
+
+    /// An empty roster has nothing to pick, and walking it must not panic or
+    /// invent a selection.
+    #[test]
+    fn walking_an_empty_crew_selects_nothing() {
+        let mut app = running_app();
+        handle_running_key(&mut app, ctrl(PREFIX));
+        handle_running_key(&mut app, key(KeyCode::Right));
+        handle_running_key(&mut app, key(KeyCode::Left));
+        assert!(app.crew.selected().is_none());
+        assert_eq!(app.focus, Focus::Command);
+    }
+
+    /// Esc is the deliberate way out of command mode from any point in it,
+    /// and it must not reach the harness as a keystroke either.
+    #[test]
+    fn esc_leaves_command_mode_from_anywhere_in_it() {
+        let mut app = app_with_crew();
+
+        // Straight out of the bare chord.
+        handle_running_key(&mut app, ctrl(PREFIX));
+        assert_eq!(handle_running_key(&mut app, key(KeyCode::Esc)), Step::Continue);
+        assert_eq!(app.focus, Focus::Terminal);
+
+        // And out of a walk of either sidebar.
+        handle_running_key(&mut app, ctrl(PREFIX));
+        handle_running_key(&mut app, key(KeyCode::Right));
+        settled_look_in(&mut app);
+        handle_running_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.focus, Focus::Terminal);
+        assert!(app.crew_preview.is_none(), "esc takes the look-in down too");
+
+        app.kill_child();
+    }
+
+    /// Walking the crew is the crew's own overlay: a live look-in on whichever
+    /// crewmate is under the cursor, which follows it and gives way to the
+    /// backlog's overlay rather than stacking with it.
+    #[test]
+    fn walking_the_crew_raises_a_look_in_that_tracks_the_selection() {
+        let mut app = app_with_crew();
+
+        handle_running_key(&mut app, ctrl(PREFIX));
+        assert!(
+            app.crew_preview.is_none() && app.crew_settles.is_none(),
+            "the chord alone must not raise it"
+        );
+
+        handle_running_key(&mut app, key(KeyCode::Right));
+        assert_eq!(settled_look_in(&mut app).as_deref(), Some("two"));
+
+        handle_running_key(&mut app, key(KeyCode::Left));
+        assert_eq!(
+            settled_look_in(&mut app).as_deref(),
+            Some("one"),
+            "the look-in follows the cursor"
+        );
+
+        // Walking back to the backlog takes it down and pops that overlay.
+        handle_running_key(&mut app, key(KeyCode::Down));
+        assert!(app.crew_preview.is_none());
+        assert!(app.task_detail);
+
+        app.kill_child();
+    }
+
+    /// How many look-ins `counting_crew_session` has been asked for. It is its
+    /// own launcher so no other test's sessions can be counted into it.
+    static LOOK_INS: AtomicUsize = AtomicUsize::new(0);
+
+    fn counting_crew_session(_: &Crewmate, join: Join) -> (String, Vec<String>) {
+        if join == Join::Preview {
+            LOOK_INS.fetch_add(1, Ordering::SeqCst);
+        }
+        ("cat".to_string(), Vec::new())
+    }
+
+    /// Joining a look-in forks a client into a crewmate's container, so walking
+    /// past crewmates to reach one must cost a single client rather than one
+    /// per keypress.
+    #[test]
+    fn a_run_of_crew_keys_only_looks_in_on_where_the_cursor_stops() {
+        let mut app = app_with_crew();
+        app.crew_launcher = counting_crew_session;
+        LOOK_INS.store(0, Ordering::SeqCst);
+
+        handle_running_key(&mut app, ctrl(PREFIX));
+        for code in [KeyCode::Right, KeyCode::Left, KeyCode::Right, KeyCode::Left] {
+            handle_running_key(&mut app, key(code));
+        }
+        assert_eq!(
+            LOOK_INS.load(Ordering::SeqCst),
+            0,
+            "a cursor still moving must not have been joined yet"
+        );
+
+        assert_eq!(settled_look_in(&mut app).as_deref(), Some("one"));
+        assert_eq!(
+            LOOK_INS.load(Ordering::SeqCst),
+            1,
+            "only the crewmate the cursor stopped on is joined"
+        );
+
+        // And standing still on that same crewmate keeps the one client rather
+        // than restarting it.
+        handle_running_key(&mut app, key(KeyCode::Left));
+        assert!(app.crew_settles.is_none());
+        let quiet = Instant::now() + CREW_SETTLE * 3;
+        while Instant::now() < quiet {
+            app.poll_child();
+            app.settle_crew_preview();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(LOOK_INS.load(Ordering::SeqCst), 1);
+
+        app.kill_child();
+    }
+
+    /// A fresh roster highlights its first entry so the list has a cursor at
+    /// all, which is the TUI's doing and not the captain's choice. Enter must
+    /// board only a crewmate they actually picked.
+    #[test]
+    fn enter_boards_nobody_until_a_crewmate_is_picked() {
+        let mut app = app_with_crew();
+        assert!(
+            app.crew.selected().is_some(),
+            "the roster highlights its first entry on its own"
+        );
+
+        handle_running_key(&mut app, ctrl(PREFIX));
+        assert_eq!(
+            handle_running_key(&mut app, key(KeyCode::Enter)),
+            Step::Continue
+        );
+        assert!(app.attached.is_none(), "the chord alone boarded a crewmate");
+        assert_eq!(app.focus, Focus::Terminal, "enter still leaves command mode");
+
+        // Walking the backlog is the other sidebar's axis, so Enter is not the
+        // crew's there either.
+        app.set_tasks(tasks::parse_backlog(
+            "## In flight\n- [ ] tui-layout - build it (since 2026-07-27)\n",
+        ));
+        handle_running_key(&mut app, ctrl(PREFIX));
+        handle_running_key(&mut app, key(KeyCode::Down));
+        handle_running_key(&mut app, key(KeyCode::Enter));
+        assert!(app.attached.is_none());
+
+        // Picking one is what hands them the pane.
+        handle_running_key(&mut app, ctrl(PREFIX));
+        handle_running_key(&mut app, key(KeyCode::Right));
+        handle_running_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.attached.as_ref().map(|s| s.crew.as_str()), Some("two"));
+
+        app.kill_child();
+    }
+
+    /// Boarding gives the crewmate the whole pane, so a backlog overlay command
+    /// mode raised over firstmate's own session must not be left on top of it.
+    #[test]
+    fn boarding_a_crewmate_takes_the_backlog_overlay_down() {
+        let mut app = app_with_crew();
+        handle_running_key(&mut app, ctrl(PREFIX));
+        handle_running_key(&mut app, key(KeyCode::Right));
+        app.task_detail = true;
+
+        handle_running_key(&mut app, key(KeyCode::Enter));
+        assert!(app.attached.is_some());
+        assert!(!app.task_detail);
+
+        app.kill_child();
+    }
+
+    /// The look-in is the crewmate's real screen, not a summary of it.
+    #[test]
+    fn the_look_in_renders_the_crewmates_own_screen() {
+        let mut app = app_with_crew();
+        handle_running_key(&mut app, ctrl(PREFIX));
+        handle_running_key(&mut app, key(KeyCode::Right));
+        settled_look_in(&mut app);
+
+        app.crew_preview
+            .as_mut()
+            .expect("a look-in on the selected crewmate")
+            .child
+            .write_input(b"ahoy from the crew\r")
+            .unwrap();
+        let arrived = pump_until(&mut app, |a| {
+            a.crew_preview
+                .as_ref()
+                .is_some_and(|s| s.parser.screen().contents().contains("ahoy from the crew"))
+        });
+        assert!(arrived, "the crewmate's own output never reached the look-in");
+
+        let rendered = render_to_string(&app, 100, 40);
+        app.kill_child();
+        assert!(
+            rendered.contains("ahoy from the crew"),
+            "expected the crewmate's screen in the look-in, got {rendered:?}"
+        );
+        assert!(rendered.contains("looking in"), "{rendered:?}");
+    }
+
+    /// Enter hands the pane to the crewmate. Firstmate's own session has to
+    /// keep running behind it, which is what makes the way back instant.
+    #[test]
+    fn enter_attaches_to_the_crewmate_and_leaves_firstmate_running() {
+        let mut app = app_with_crew();
+        app.child = Some(child::spawn("cat", &[], None, 24, 80).unwrap());
+
+        handle_running_key(&mut app, ctrl(PREFIX));
+        handle_running_key(&mut app, key(KeyCode::Right));
+        assert_eq!(handle_running_key(&mut app, key(KeyCode::Enter)), Step::Continue);
+
+        assert_eq!(app.attached.as_ref().map(|s| s.crew.as_str()), Some("two"));
+        assert_eq!(app.focus, Focus::Terminal, "the crewmate gets the keyboard");
+        assert!(app.crew_preview.is_none(), "the look-in gives way to the pane");
+        assert!(app.child.is_some(), "firstmate's own session keeps running");
+
+        // The captain's keys now land in the crewmate's session, not firstmate's.
+        for c in "ahoy".chars() {
+            handle_running_key(&mut app, key(KeyCode::Char(c)));
+        }
+        let landed = pump_until(&mut app, |a| {
+            a.attached
+                .as_ref()
+                .is_some_and(|s| s.parser.screen().contents().contains("ahoy"))
+        });
+        let rendered = render_to_string(&app, 100, 40);
+        let firstmate_screen = app.parser.screen().contents();
+        app.kill_child();
+
+        assert!(landed, "the captain's keys never reached the crewmate");
+        assert!(
+            !firstmate_screen.contains("ahoy"),
+            "firstmate's own session must not have been typed at, got {firstmate_screen:?}"
+        );
+        assert!(rendered.contains("attached to two"), "{rendered:?}");
+    }
+
+    /// Esc is only a way out of command mode, so it must not undo the boarding
+    /// the captain asked for; `f` is what comes back from that.
+    #[test]
+    fn esc_drops_the_look_in_but_leaves_the_captain_attached() {
+        let mut app = app_with_crew();
+        handle_running_key(&mut app, ctrl(PREFIX));
+        handle_running_key(&mut app, key(KeyCode::Right));
+        handle_running_key(&mut app, key(KeyCode::Enter));
+
+        handle_running_key(&mut app, ctrl(PREFIX));
+        handle_running_key(&mut app, key(KeyCode::Left));
+        assert!(settled_look_in(&mut app).is_some());
+
+        handle_running_key(&mut app, key(KeyCode::Esc));
+        assert!(app.crew_preview.is_none());
+        assert_eq!(app.focus, Focus::Terminal);
+        assert_eq!(
+            app.attached.as_ref().map(|s| s.crew.as_str()),
+            Some("two"),
+            "esc must not put the captain back at firstmate"
+        );
+
+        app.kill_child();
+    }
+
+    /// The one key that always gets home, from a look-in, from an attached
+    /// crewmate, and from a backlog overlay alike.
+    #[test]
+    fn the_chord_then_f_returns_to_firstmate_from_anywhere() {
+        let mut app = app_with_crew();
+        app.child = Some(child::spawn("cat", &[], None, 24, 80).unwrap());
+
+        // From an attached crewmate, with a look-in raised over it as well.
+        handle_running_key(&mut app, ctrl(PREFIX));
+        handle_running_key(&mut app, key(KeyCode::Right));
+        handle_running_key(&mut app, key(KeyCode::Enter));
+        handle_running_key(&mut app, ctrl(PREFIX));
+        handle_running_key(&mut app, key(KeyCode::Left));
+        assert!(app.attached.is_some() && settled_look_in(&mut app).is_some());
+
+        // Walking the crew is already command mode, so `f` lands directly,
+        // exactly as `q` does.
+        assert_eq!(handle_running_key(&mut app, key(KeyCode::Char('f'))), Step::Continue);
+        assert!(app.attached.is_none() && app.crew_preview.is_none());
+        assert_eq!(app.focus, Focus::Terminal);
+        let rendered = render_to_string(&app, 100, 40);
+        assert!(
+            rendered.contains("claude") && !rendered.contains("attached to"),
+            "expected firstmate's own session back in the pane, got {rendered:?}"
+        );
+
+        // And from a backlog overlay, which is the other thing command mode
+        // can leave standing.
+        app.set_tasks(tasks::parse_backlog(
+            "## In flight\n- [ ] tui-layout - build it (since 2026-07-27)\n  the whole story\n",
+        ));
+        handle_running_key(&mut app, ctrl(PREFIX));
+        handle_running_key(&mut app, key(KeyCode::Down));
+        assert!(app.task_detail);
+        handle_running_key(&mut app, ctrl(PREFIX));
+        handle_running_key(&mut app, key(KeyCode::Char('f')));
+        assert!(!app.task_detail);
+        assert_eq!(app.focus, Focus::Terminal);
+
+        app.kill_child();
+    }
+
+    /// A crewmate's session ending under the captain - they detached inside
+    /// tmux, or it died - has to put them back at firstmate rather than
+    /// leaving the pane frozen on a dead client.
+    #[test]
+    fn a_crewmate_session_closing_puts_the_captain_back_at_firstmate() {
+        let mut app = app_with_crew();
+        app.child = Some(child::spawn("cat", &[], None, 24, 80).unwrap());
+
+        handle_running_key(&mut app, ctrl(PREFIX));
+        handle_running_key(&mut app, key(KeyCode::Right));
+        handle_running_key(&mut app, key(KeyCode::Enter));
+        app.attached.as_mut().expect("an attached crewmate").close();
+
+        let returned = pump_until(&mut app, |a| a.attached.is_none());
+        let notice = app.notice.clone();
+        app.kill_child();
+
+        assert!(returned, "the closed session was never taken down");
+        assert!(
+            notice.is_some_and(|n| n.contains("two")),
+            "the captain should be told whose session closed"
+        );
+    }
+
+    /// A collapsed crew pane has no visible selection, so there is nothing to
+    /// look in on and nothing to attach to either.
+    #[test]
+    fn a_narrow_terminal_keeps_the_look_in_down_and_attaches_to_nothing() {
+        let mut app = app_with_crew();
+        app.sync_size(Rect::new(0, 0, 50, 20));
+
+        handle_running_key(&mut app, ctrl(PREFIX));
+        handle_running_key(&mut app, key(KeyCode::Right));
+        assert!(app.crew_preview.is_none() && app.crew_settles.is_none());
+
+        assert_eq!(handle_running_key(&mut app, key(KeyCode::Enter)), Step::Continue);
+        assert!(app.attached.is_none());
+
+        app.kill_child();
+    }
+
+    /// Command mode walks the sidebars in place and only leaves for a key
+    /// that is not a navigation key.
     #[test]
     fn command_mode_scrolls_the_sidebars_and_stays() {
         let mut app = running_app();
